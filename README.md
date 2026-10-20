@@ -30,15 +30,19 @@ several km per hop. In the EU (incl. Malta) use the **868 MHz** version, e.g. He
 WiFi LoRa 32 V3 or Wireless Stick Lite V3.
 
 1. Flash Meshtastic firmware on the board (flasher.meshtastic.org) and set region EU_868
-   once with the Meshtastic app. Then close the Meshtastic app so it releases the board.
-2. In OffGrid Chat tap **LoRa radio**, pick the board. Android asks to pair; boards without
-   a screen use PIN 123456 unless changed.
+   once with the Meshtastic app. Keep the default channel and LongFast preset if you want
+   other people's Meshtastic nodes to relay for you. Then, in the Meshtastic app, disconnect
+   from the board: it only accepts one phone connection at a time.
+2. In OffGrid Chat tap **LoRa radio** and pick the board. Android asks to pair: boards with a
+   screen show the PIN on it, boards without one use 123456 unless changed.
 
 How it works: our signed packets travel as Meshtastic PRIVATE_APP broadcasts (split into
-≤220-byte pieces), so any Meshtastic node, including public ones, floods them onward. To
-save airtime (EU868 is ~1% duty cycle) only messages, receipts and your own announcement go
-over LoRa, and phones don't swap inventories over it. A phone with a radio bridges: what it
-hears over LoRa it relays to nearby Bluetooth phones and vice versa.
+≤220-byte pieces, hop limit 3), so any Meshtastic node on the same channel relays them, up
+to 3 hops beyond your own board. Airtime is scarce (a full piece is about 1 s on air on
+LongFast, and the board's transmit queue is small), so only messages, receipts and your own
+announcement go over LoRa, phones don't swap inventories over it, and the app waits for
+free space in the board's queue. A phone with a radio bridges: what it hears over LoRa it
+relays to nearby Bluetooth phones and vice versa.
 
 ## Privacy and security
 

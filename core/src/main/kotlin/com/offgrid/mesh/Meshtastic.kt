@@ -21,8 +21,20 @@ object Meshtastic {
     /** Data.payload max is 233 bytes (DATA_PAYLOAD_LEN); keep some slack. */
     const val MAX_PAYLOAD = 220
 
+    /** Hops a broadcast may take across the Meshtastic network (Meshtastic's default). */
+    const val HOP_LIMIT = 3
+
     /** A received PRIVATE_APP payload and the Meshtastic node number that sent it. */
     class Received(val fromNode: Long, val payload: ByteArray)
+
+    /** The parts of one FromRadio message we care about; all null for anything else. */
+    class FromRadio(
+        val received: Received? = null,
+        /** Set when the radio has finished sending its config after our want_config. */
+        val configCompleteId: Long? = null,
+        /** Free slots in the radio's transmit queue, from QueueStatus. */
+        val queueFree: Int? = null,
+    )
 
     /** ToRadio { want_config_id } — starts the session; the radio then streams its config. */
     fun wantConfig(nonce: Int): ByteArray = ProtoWriter().varint(3, nonce.toLong() and 0xFFFFFFFFL).bytes()
@@ -31,12 +43,25 @@ object Meshtastic {
     fun broadcast(payload: ByteArray, packetId: Int): ByteArray {
         require(payload.size <= 233)
         val data = ProtoWriter().varint(1, PORT_PRIVATE_APP.toLong()).bytes(2, payload).bytes()
+        // hop_limit must be set: the firmware only fills in a default when want_ack is set,
+        // and we don't want acks (retransmissions) on broadcasts.
         val packet = ProtoWriter()
             .fixed32(2, BROADCAST_NODE)
             .message(4, data)
             .fixed32(6, packetId.toLong() and 0xFFFFFFFFL)
+            .varint(9, HOP_LIMIT.toLong())
             .bytes()
         return ProtoWriter().message(1, packet).bytes()
+    }
+
+    fun inspect(bytes: ByteArray): FromRadio {
+        val fields = ProtoReader(bytes).fields()
+        fields.firstOrNull { it.number == 7 && it.wire == 0 }?.let { return FromRadio(configCompleteId = it.value) }
+        fields.firstOrNull { it.number == 11 }?.bytes?.let { q ->
+            val free = ProtoReader(q).fields().firstOrNull { it.number == 2 }?.value ?: return FromRadio()
+            return FromRadio(queueFree = free.toInt())
+        }
+        return FromRadio(received = parseFromRadio(bytes))
     }
 
     /** Pulls our payload out of a FromRadio message, or null if it's anything else (config, other apps, …). */
@@ -151,12 +176,17 @@ object Meshtastic {
  * lost, duplicated or reordered, and several senders interleave, so pieces carry a random
  * message id and are reassembled per sender with a timeout.
  *
- * Piece layout: messageId (4 bytes) | index (u8) | count (u8) | data
+ * Piece layout: magic (u8) | messageId (4 bytes) | index (u8) | count (u8) | data
+ *
+ * PRIVATE_APP is shared by every Meshtastic user, so the magic byte filters out other apps.
  */
 class LoraFragmenter(private val clock: () -> Long = System::currentTimeMillis) {
     companion object {
-        const val HEADER = 6
-        const val MAX_PIECES = 32
+        const val MAGIC: Byte = 0x4F  // 'O'
+        const val HEADER = 7
+        /** The radio's transmit queue holds 16 packets, shared with relaying; stay well under. */
+        const val MAX_PIECES = 8
+        private const val MAX_PARTIALS = 64
         const val TIMEOUT_MS = 10 * 60_000L
     }
 
@@ -173,28 +203,28 @@ class LoraFragmenter(private val clock: () -> Long = System::currentTimeMillis) 
         require(count <= MAX_PIECES) { "too big for LoRa" }
         val id = Crypto.randomBytes(4)
         return (0 until count).map { i ->
-            id + byteArrayOf(i.toByte(), count.toByte()) +
+            byteArrayOf(MAGIC) + id + byteArrayOf(i.toByte(), count.toByte()) +
                 blob.copyOfRange(i * chunk, minOf(blob.size, (i + 1) * chunk))
         }
     }
 
     /** Returns the whole blob when its last missing piece arrives. */
     fun accept(sender: Long, piece: ByteArray): ByteArray? {
-        if (piece.size < HEADER) return null
+        if (piece.size < HEADER || piece[0] != MAGIC) return null
         val now = clock()
         partials.entries.removeAll { now - it.value.startedAt > TIMEOUT_MS }
-        val index = piece[4].toInt() and 0xFF
-        val count = piece[5].toInt() and 0xFF
+        val index = piece[5].toInt() and 0xFF
+        val count = piece[6].toInt() and 0xFF
         if (count == 0 || count > MAX_PIECES || index >= count) return null
-        val key = "$sender:" + piece.copyOf(4).toHex()
+        val key = "$sender:" + piece.copyOfRange(1, 5).toHex()
         val p = partials.getOrPut(key) { Partial(count, now) }
+        while (partials.size > MAX_PARTIALS) partials.remove(partials.keys.first())
         if (p.count != count) return null
         p.pieces[index] = piece.copyOfRange(HEADER, piece.size)
         if (!p.complete) return null
         partials.remove(key)
         val out = ByteArrayOutputStream()
         p.pieces.forEach { out.write(it!!) }
-        while (partials.size > 200) partials.remove(partials.keys.first())
         return out.toByteArray()
     }
 }

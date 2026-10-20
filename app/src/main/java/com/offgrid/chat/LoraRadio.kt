@@ -12,7 +12,10 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -30,10 +33,10 @@ import kotlin.random.Random
  * Meshtastic network) floods them onward, several km per hop.
  *
  * To the router this is a single link, [LINK], with no inventory sync because LoRa airtime
- * is scarce (EU868 allows ~1% duty cycle).
+ * is scarce (each 220-byte packet is ~1 s on air, and EU868 caps transmit time).
  *
- * Main-thread only. First connection triggers Android's pairing dialog; boards without a
- * screen use PIN 123456 unless it was changed in the Meshtastic app.
+ * Main-thread only. The first connection asks Android to pair: boards with a screen show
+ * a PIN on it, boards without one use 123456 unless it was changed in the Meshtastic app.
  */
 @SuppressLint("MissingPermission")
 class LoraRadio(
@@ -56,7 +59,8 @@ class LoraRadio(
 
     /** One GATT operation; Android allows only one in flight per connection. */
     private sealed class Op {
-        class Write(val value: ByteArray) : Op()
+        /** [usesTxSlot]: a mesh packet that takes a slot in the radio's transmit queue. */
+        class Write(val value: ByteArray, val usesTxSlot: Boolean) : Op()
         object Read : Op()
         object Subscribe : Op()
     }
@@ -73,6 +77,10 @@ class LoraRadio(
     private val queue = ArrayDeque<Op>()
     private var busy = false
     private var draining = false
+    private var pendingNotify = false
+    private var configNonce = 0
+    /** Free slots in the radio's TX queue (from QueueStatus). Start cautious until it tells us. */
+    private var txFree = 2
 
     var state = State.OFF
         private set
@@ -106,7 +114,7 @@ class LoraRadio(
             Log.w(TAG, "radio queue full, dropping")
             return
         }
-        pieces.forEach { queue.addLast(Op.Write(Meshtastic.broadcast(it, Random.nextInt()))) }
+        pieces.forEach { queue.addLast(Op.Write(Meshtastic.broadcast(it, Random.nextInt()), usesTxSlot = true)) }
         pump()
     }
 
@@ -118,6 +126,13 @@ class LoraRadio(
         deviceName = runCatching { device.name }.getOrNull() ?: addr
         state = State.CONNECTING
         Mesh.changed()
+        // Meshtastic only talks to bonded phones. Pair first (Android shows the PIN dialog),
+        // then connect; closing GATT mid-pairing would cancel the dialog.
+        if (device.bondState != BluetoothDevice.BOND_BONDED) {
+            watchBonding()
+            if (device.bondState != BluetoothDevice.BOND_BONDING && !device.createBond()) scheduleReconnect()
+            return
+        }
         gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
         if (gatt == null) scheduleReconnect()
     }
@@ -130,9 +145,41 @@ class LoraRadio(
         queue.clear()
         busy = false
         draining = false
+        pendingNotify = false
+        txFree = 2
+        stopWatchingBonding()
+        main.removeCallbacks(txRetry)
         state = State.OFF
         if (wasUp) events.onLinkDown(LINK)
         Mesh.changed()
+    }
+
+    private var bondReceiver: BroadcastReceiver? = null
+
+    private fun watchBonding() {
+        if (bondReceiver != null) return
+        val r = object : BroadcastReceiver() {
+            override fun onReceive(c: Context, intent: Intent) {
+                val d: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                }
+                if (d?.address != address) return
+                when (intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1)) {
+                    BluetoothDevice.BOND_BONDED -> { stopWatchingBonding(); state = State.OFF; open() }
+                    BluetoothDevice.BOND_NONE -> { stopWatchingBonding(); scheduleReconnect() }
+                }
+            }
+        }
+        bondReceiver = r
+        context.registerReceiver(r, IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED))
+    }
+
+    private fun stopWatchingBonding() {
+        bondReceiver?.let { runCatching { context.unregisterReceiver(it) } }
+        bondReceiver = null
     }
 
     private val reconnect = Runnable { if (address != null && state == State.OFF) open() }
@@ -172,8 +219,9 @@ class LoraRadio(
                     return@post
                 }
                 // Session start: subscribe, ask for config (which unlocks packet delivery), read it all.
+                configNonce = Random.nextInt(1, Int.MAX_VALUE)
                 queue.addLast(Op.Subscribe)
-                queue.addLast(Op.Write(Meshtastic.wantConfig(Random.nextInt())))
+                queue.addLast(Op.Write(Meshtastic.wantConfig(configNonce), usesTxSlot = false))
                 queue.addLast(Op.Read)
                 draining = true
                 pump()
@@ -185,15 +233,7 @@ class LoraRadio(
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
-            main.post {
-                if (g !== gatt) return@post
-                if (state == State.CONNECTING && status == BluetoothGatt.GATT_SUCCESS) {
-                    state = State.CONNECTED
-                    events.onLinkUp(LINK)
-                    Mesh.changed()
-                }
-                opDone(status)
-            }
+            main.post { if (g === gatt) opDone(status) }
         }
 
         @Deprecated("Deprecated in Java")
@@ -221,42 +261,72 @@ class LoraRadio(
 
     /** The radio has new data for us: read FromRadio until it comes back empty. */
     private fun fromNumChanged() {
-        if (draining) return
+        if (draining) {
+            // A read is in flight; it might come back empty before this new data. Read once more after.
+            pendingNotify = true
+            return
+        }
         draining = true
-        queue.addLast(Op.Read)
+        queue.addFirst(Op.Read)
         pump()
     }
 
     private fun onRead(value: ByteArray, status: Int) {
         busy = false
+        if (failed(status)) return
         if (status != BluetoothGatt.GATT_SUCCESS || value.isEmpty()) {
             draining = false
-        } else {
-            Meshtastic.parseFromRadio(value)?.let { got ->
-                fragmenter.accept(got.fromNode, got.payload)?.let { events.onLinkData(LINK, it) }
+            if (pendingNotify) {
+                pendingNotify = false
+                fromNumChanged()
+                return
             }
+        } else {
+            handle(Meshtastic.inspect(value))
             queue.addFirst(Op.Read)  // keep draining before sending more
         }
         pump()
     }
 
+    private fun handle(msg: Meshtastic.FromRadio) {
+        msg.queueFree?.let { txFree = it }
+        msg.received?.let { got ->
+            fragmenter.accept(got.fromNode, got.payload)?.let { events.onLinkData(LINK, it) }
+        }
+        if (msg.configCompleteId == configNonce.toLong() && state == State.CONNECTING) {
+            state = State.CONNECTED
+            events.onLinkUp(LINK)
+            Mesh.changed()
+        }
+    }
+
     private fun opDone(status: Int) {
         busy = false
-        if (status != BluetoothGatt.GATT_SUCCESS) {
-            Log.w(TAG, "radio op failed: $status")
-            // Insufficient authentication/encryption means pairing is in progress or was refused.
-            if (status == 5 || status == 15 || status == 137) {
-                scheduleReconnect()
-                return
-            }
-        }
+        if (failed(status)) return
+        if (status != BluetoothGatt.GATT_SUCCESS) Log.w(TAG, "radio op failed: $status")
         pump()
+    }
+
+    /** Auth/encryption errors mean the bond is gone or refused: start over (which re-pairs). */
+    private fun failed(status: Int): Boolean {
+        if (status != 5 && status != 15 && status != 137) return false
+        Log.w(TAG, "radio refused us ($status), re-pairing")
+        scheduleReconnect()
+        return true
     }
 
     private fun pump() {
         val g = gatt ?: return
         if (busy) return
-        val op = queue.removeFirstOrNull() ?: return
+        val op = queue.firstOrNull() ?: return
+        if (op is Op.Write && op.usesTxSlot && txFree <= 0) {
+            // Radio's transmit queue is full; it sends QueueStatus as it frees up. Poll as a fallback.
+            main.removeCallbacks(txRetry)
+            main.postDelayed(txRetry, 3_000)
+            return
+        }
+        queue.removeFirst()
+        if (op is Op.Write && op.usesTxSlot) txFree--
         busy = true
         val started = when (op) {
             is Op.Write -> write(g, toRadio!!, op.value)
@@ -265,9 +335,15 @@ class LoraRadio(
         }
         if (!started) {
             busy = false
+            if (op is Op.Write && op.usesTxSlot) txFree++
             queue.addFirst(op)
             main.postDelayed({ pump() }, 100)
         }
+    }
+
+    private val txRetry = Runnable {
+        if (txFree <= 0) txFree = 1
+        pump()
     }
 
     private fun subscribe(g: BluetoothGatt): Boolean {

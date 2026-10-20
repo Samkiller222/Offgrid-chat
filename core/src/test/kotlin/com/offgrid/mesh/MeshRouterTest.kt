@@ -303,6 +303,12 @@ class MeshRouterTest {
         val fields = Meshtastic.ProtoReader(packet).fields()
         assertEquals(0xFFFFFFFFL, fields.single { it.number == 2 }.value)
         assertEquals(0x01020304L, fields.single { it.number == 6 }.value)
+        assertEquals(Meshtastic.HOP_LIMIT.toLong(), fields.single { it.number == 9 }.value, "must set hop_limit")
+        assertTrue(fields.none { it.number == 10 }, "no want_ack on broadcasts")
+        // Session/queue messages are recognised.
+        assertEquals(77L, Meshtastic.inspect(Meshtastic.ProtoWriter().varint(7, 77).bytes()).configCompleteId)
+        val queue = Meshtastic.ProtoWriter().varint(2, 5).varint(3, 16).bytes()
+        assertEquals(5, Meshtastic.inspect(Meshtastic.ProtoWriter().message(11, queue).bytes()).queueFree)
         // The radio echoes packets back inside FromRadio.packet (#2) with a from field.
         val meshPacket = Meshtastic.ProtoWriter().fixed32(1, 0xDEADBEEFL)
             .message(4, fields.single { it.number == 4 }.bytes!!).bytes()
@@ -330,6 +336,8 @@ class MeshRouterTest {
             .forEach { (sender, piece) -> r.accept(sender, piece)?.let { out += it } }
         assertEquals(2, out.size)
         assertTrue(out.any { it.contentEquals(a) } && out.any { it.contentEquals(b) })
+        // Other apps' PRIVATE_APP traffic (no magic byte) is ignored.
+        assertNull(r.accept(3L, byteArrayOf(1, 2, 3, 4, 5, 0, 1, 9)))
     }
 
     @Test
