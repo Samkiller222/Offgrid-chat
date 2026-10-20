@@ -132,7 +132,7 @@ class BleTransport(
         }
     }
 
-    private class Sighting(var device: BluetoothDevice, var lastSeen: Long, val firstSeen: Long)
+    private class Sighting(var device: BluetoothDevice, var lastSeen: Long, var firstSeen: Long)
 
     private val main = Handler(Looper.getMainLooper())
     private val btManager: BluetoothManager? = context.getSystemService(BluetoothManager::class.java)
@@ -150,6 +150,11 @@ class BleTransport(
 
     val linkCount: Int get() = links.values.count { it.ready }
 
+    /** Run on the main thread, unless we've been stopped in the meantime. */
+    private fun post(block: () -> Unit) {
+        main.post { if (running) block() }
+    }
+
     fun start() {
         if (running) return
         if (adapter?.isEnabled != true) {
@@ -157,8 +162,7 @@ class BleTransport(
             return
         }
         running = true
-        openServer()
-        startAdvertising()
+        openServer()  // advertising starts once the service is registered (onServiceAdded)
         startScanning()
         main.postDelayed(housekeeping, 5_000)
         main.postDelayed(restartScan, SCAN_RESTART_MS)
@@ -191,7 +195,8 @@ class BleTransport(
 
     override fun send(link: String, bytes: ByteArray) {
         val l = links[link] ?: return
-        val maxFrame = (l.mtu - 3).coerceAtLeast(20)
+        // An attribute value can't exceed 512 bytes even when the MTU is 517.
+        val maxFrame = (l.mtu - 3).coerceIn(20, 512)
         l.streamId = (l.streamId + 1) and 0xFFFF
         Framing.split(bytes, l.streamId, maxFrame).forEach { l.outbox.addLast(it) }
         pump(l)
@@ -226,6 +231,12 @@ class BleTransport(
     }
 
     private fun dropLink(l: Link) {
+        val peer = when (l) {
+            is ClientLink -> l.token
+            else -> l.peerToken
+        }
+        // Give the designated (lower-token) side the first chance to reconnect.
+        peer?.let { sightings[it]?.firstSeen = SystemClock.elapsedRealtime() }
         if (links.remove(l.name) != null && l.ready) {
             Log.i(TAG, "link down ${l.name}")
             events.onLinkDown(l.name)
@@ -269,13 +280,25 @@ class BleTransport(
             ),
         )
         service.addCharacteristic(tx)
-        server = btManager?.openGattServer(context, serverCallback)?.also { it.addService(service) }
+        server = try {
+            btManager?.openGattServer(context, serverCallback)?.also { it.addService(service) }
+        } catch (e: Exception) {
+            Log.e(TAG, "openGattServer", e)
+            null
+        }
         if (server == null) Log.e(TAG, "Could not open GATT server")
     }
 
     private val serverCallback = object : BluetoothGattServerCallback() {
+        override fun onServiceAdded(status: Int, service: BluetoothGattService) {
+            post {
+                if (status == BluetoothGatt.GATT_SUCCESS) startAdvertising()
+                else Log.e(TAG, "addService failed: $status")
+            }
+        }
+
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
-            main.post {
+            post {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     serverLinks.getOrPut(device.address) { ServerLink(device) }
                 } else {
@@ -285,7 +308,7 @@ class BleTransport(
         }
 
         override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
-            main.post { serverLinks[device.address]?.mtu = mtu }
+            post { serverLinks[device.address]?.mtu = mtu }
         }
 
         override fun onCharacteristicWriteRequest(
@@ -297,15 +320,35 @@ class BleTransport(
             offset: Int,
             value: ByteArray,
         ) {
+            if (preparedWrite) {
+                // We never send frames bigger than one write, so long writes aren't supported.
+                if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, 0, null)
+                return
+            }
             if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             val uuid = characteristic.uuid
-            main.post {
+            post {
                 val l = serverLinks.getOrPut(device.address) { ServerLink(device) }
                 when (uuid) {
                     HELLO_UUID -> if (value.size == TOKEN_SIZE) {
-                        l.peerToken = ByteBuffer.wrap(value).int
+                        val peer = ByteBuffer.wrap(value).int
+                        l.peerToken = peer
                         // If we were also dialing them, our outgoing attempt is redundant.
-                        l.peerToken?.let { cancelDial(it) }
+                        cancelDial(peer)
+                        // Both sides dialed (e.g. after the fallback timer). Keep the connection the
+                        // lower token made and drop the other, so traffic isn't sent twice.
+                        val mine = clientLinks.values.firstOrNull { it.token == peer }
+                        if (mine != null) {
+                            if (tokenInt > peer) {
+                                clientLinks.remove(mine.gatt.device.address)
+                                dropLink(mine)
+                                mine.close()
+                            } else {
+                                serverLinks.remove(device.address)
+                                dropLink(l)
+                                l.close()
+                            }
+                        }
                     }
                     RX_UUID -> receiveFrame(l, value)
                 }
@@ -324,7 +367,7 @@ class BleTransport(
             if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             val enable = value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
             val tx = descriptor.characteristic
-            main.post {
+            post {
                 val l = serverLinks.getOrPut(device.address) { ServerLink(device) }
                 if (enable && descriptor.uuid == CCCD_UUID) {
                     l.tx = tx
@@ -335,7 +378,7 @@ class BleTransport(
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
-            main.post { frameSent(serverLinks[device.address]) }
+            post { frameSent(serverLinks[device.address]) }
         }
     }
 
@@ -358,7 +401,11 @@ class BleTransport(
             .addServiceData(ParcelUuid(SERVICE_UUID), token)
             .setIncludeDeviceName(false)
             .build()
-        adapter?.bluetoothLeAdvertiser?.startAdvertising(settings, data, scanResponse, advertiseCallback)
+        try {
+            adapter?.bluetoothLeAdvertiser?.startAdvertising(settings, data, scanResponse, advertiseCallback)
+        } catch (e: Exception) {
+            Log.e(TAG, "startAdvertising", e)
+        }
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
@@ -399,7 +446,7 @@ class BleTransport(
             if (data.size != TOKEN_SIZE) return
             val peerToken = ByteBuffer.wrap(data).int
             val device = result.device
-            main.post { onSighting(peerToken, device) }
+            post { onSighting(peerToken, device) }
         }
 
         override fun onBatchScanResults(results: MutableList<ScanResult>) {
@@ -426,7 +473,7 @@ class BleTransport(
 
     private fun maybeConnect(peerToken: Int, s: Sighting, now: Long) {
         if (isLinked(peerToken) || peerToken in connectingTokens) return
-        if (clientLinks.size + connectingTokens.size >= MAX_OUTGOING) return
+        if ((clientLinks.values.map { it.token } + connectingTokens.keys).toSet().size >= MAX_OUTGOING) return
         backoff[peerToken]?.let { (retryAt, _) -> if (now < retryAt) return }
         // Lower token dials. The higher one only dials if the other side never showed up
         // (e.g. it can't see our adverts, or it's at its connection limit).
@@ -473,7 +520,7 @@ class BleTransport(
 
     private fun clientCallback(peerToken: Int) = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            main.post {
+            post {
                 if (pendingGatts[peerToken] === gatt) pendingGatts.remove(peerToken)
                 val address = gatt.device.address
                 if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
@@ -494,14 +541,14 @@ class BleTransport(
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            main.post {
+            post {
                 clientLinks[gatt.device.address]?.mtu = if (status == BluetoothGatt.GATT_SUCCESS) mtu else 23
                 gatt.discoverServices()
             }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            main.post {
+            post {
                 val l = clientLinks[gatt.device.address] ?: return@post
                 val service = gatt.getService(SERVICE_UUID)
                 val rx = service?.getCharacteristic(RX_UUID)
@@ -518,7 +565,7 @@ class BleTransport(
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
             val uuid = characteristic.uuid
-            main.post {
+            post {
                 val l = clientLinks[gatt.device.address] ?: return@post
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     gatt.disconnect()
@@ -529,7 +576,7 @@ class BleTransport(
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            main.post {
+            post {
                 val l = clientLinks[gatt.device.address] ?: return@post
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     gatt.disconnect()
@@ -553,7 +600,7 @@ class BleTransport(
         }
 
         private fun onNotified(gatt: BluetoothGatt, value: ByteArray) {
-            main.post { clientLinks[gatt.device.address]?.let { receiveFrame(it, value) } }
+            post { clientLinks[gatt.device.address]?.let { receiveFrame(it, value) } }
         }
     }
 

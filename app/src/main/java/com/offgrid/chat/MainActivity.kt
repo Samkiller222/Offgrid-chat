@@ -33,19 +33,9 @@ class MainActivity : Activity() {
     private lateinit var list: ListView
     private lateinit var adapter: ArrayAdapter<Row>
     private lateinit var toggle: Button
+    /** Stop re-asking in a loop after a denial; the user fixes it in Settings. */
+    private var permissionsDenied = false
     private val refresh: () -> Unit = { render() }
-
-    private val requiredPermissions: Array<String>
-        get() = buildList {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                add(Manifest.permission.BLUETOOTH_SCAN)
-                add(Manifest.permission.BLUETOOTH_ADVERTISE)
-                add(Manifest.permission.BLUETOOTH_CONNECT)
-            } else {
-                add(Manifest.permission.ACCESS_FINE_LOCATION)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) add(Manifest.permission.POST_NOTIFICATIONS)
-        }.toTypedArray()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -62,6 +52,7 @@ class MainActivity : Activity() {
                     MeshService.stop(this@MainActivity)
                 } else {
                     MeshService.start(this@MainActivity)
+                    ensureRunning()
                 }
                 render()
             }
@@ -135,11 +126,22 @@ class MainActivity : Activity() {
     }
 
     private fun ensureRunning() {
-        val missing = requiredPermissions.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-        if (missing.isNotEmpty()) {
+        val missing = MeshService.bluetoothPermissions
+            .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+            .toMutableList()
+        // Notifications are nice to have: ask once, never block on them.
+        val prefs = getSharedPreferences("offgrid", MODE_PRIVATE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !prefs.getBoolean("askedNotifications", false) &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            prefs.edit().putBoolean("askedNotifications", true).apply()
+            missing += Manifest.permission.POST_NOTIFICATIONS
+        }
+        if (missing.isNotEmpty() && !permissionsDenied) {
             requestPermissions(missing.toTypedArray(), 1)
             return
         }
+        if (!MeshService.hasPermissions(this)) return
         val adapter = getSystemService(BluetoothManager::class.java)?.adapter
         if (adapter == null) {
             status.text = "This phone has no Bluetooth."
@@ -158,6 +160,7 @@ class MainActivity : Activity() {
             permissions[it] != Manifest.permission.POST_NOTIFICATIONS && results[it] != PackageManager.PERMISSION_GRANTED
         }
         if (bluetoothDenied) {
+            permissionsDenied = true
             status.text = "Bluetooth permission is needed to reach nearby phones. Allow it in Settings > Apps."
         } else {
             ensureRunning()
@@ -169,7 +172,8 @@ class MainActivity : Activity() {
         toggle.text = if (enabled) "Stop relaying" else "Start relaying"
         val s = Mesh.service
         if (s == null) {
-            me.text = if (enabled) "Starting…" else "Relaying is off. Messages can't reach you or pass through you."
+            me.text = if (!MeshService.hasPermissions(this)) "Needs Bluetooth (Nearby devices) permission to start"
+            else if (enabled) "Starting…" else "Relaying is off. Messages can't reach you or pass through you."
             adapter.clear()
             return
         }

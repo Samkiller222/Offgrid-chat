@@ -69,6 +69,7 @@ class MeshRouter(
         private const val LINK_INVENTORY: Byte = 2
         private const val SHORT_ID = 8
         private const val MAX_SEEN = 10_000
+        private const val MAX_HANDLED = 2000
         private val PRIORITY = listOf(Packet.Type.ACK, Packet.Type.MESSAGE, Packet.Type.ANNOUNCE)
     }
 
@@ -78,6 +79,7 @@ class MeshRouter(
     private val seen = LinkedHashSet<String>()
     private val delivered = LinkedHashSet<String>()     // message ids we've seen an ACK for
     private val contacts = HashMap<String, Contact>()
+    private val handled = ArrayDeque<ByteArray>()
 
     val myId: String get() = identity.id
     val myPublicKey: ByteArray get() = identity.publicEncoded
@@ -86,7 +88,11 @@ class MeshRouter(
     init {
         val now = clock()
         for (packet in store.all()) {
-            if (packet.isExpired(now)) store.remove(packet.idHex) else markSeen(packet.idHex)
+            if (packet.isExpired(now)) {
+                store.remove(packet.idHex)
+                continue
+            }
+            markSeen(packet.idHex)
             if (packet.type == Packet.Type.ANNOUNCE) learnContact(packet)
             if (packet.type == Packet.Type.ACK) delivered.add(deliveryKey(packet.payload.toHex(), packet.originId))
         }
@@ -131,6 +137,9 @@ class MeshRouter(
         val out = ByteArrayOutputStream()
         out.write(LINK_INVENTORY.toInt())
         store.all().forEach { out.write(it.id, 0, SHORT_ID) }
+        // Also list what we handled but don't carry (delivered to us, or at its hop limit),
+        // so neighbours don't resend it every time we meet.
+        handled.forEach { out.write(it, 0, SHORT_ID) }
         transport?.send(link, out.toByteArray())
     }
 
@@ -216,28 +225,42 @@ class MeshRouter(
         if (packet.hops > packet.maxHops) return
         if (!packet.verify()) return
         markSeen(idHex)
+        if (!process(packet)) {
+            noteHandled(packet)
+            return
+        }
+        if (!relay(packet, fromLink)) noteHandled(packet)
+    }
 
+    private fun noteHandled(packet: Packet) {
+        handled.addLast(packet.id.copyOf(SHORT_ID))
+        while (handled.size > MAX_HANDLED) handled.removeFirst()
+    }
+
+    /** Act on a fresh, valid packet. Returns true if it should travel on to other phones. */
+    private fun process(packet: Packet): Boolean {
+        val idHex = packet.idHex
         when (packet.type) {
             Packet.Type.ANNOUNCE -> {
-                if (packet.originId == myId) return
+                if (packet.originId == myId) return false
                 // Only carry each person's newest announcement.
                 val older = store.all().filter { it.type == Packet.Type.ANNOUNCE && it.originId == packet.originId }
-                if (older.any { it.createdAt > packet.createdAt }) return
+                if (older.any { it.createdAt > packet.createdAt }) return false
                 older.forEach { store.remove(it.idHex) }
                 learnContact(packet)
             }
 
             Packet.Type.MESSAGE -> {
-                if (packet.destinationId != null && deliveryKey(idHex, packet.destinationId!!) in delivered) return
+                if (packet.destinationId != null && deliveryKey(idHex, packet.destinationId!!) in delivered) return false
                 if (packet.destinationId == myId) {
                     deliverDirect(packet)
-                    return  // Reached its destination: no need to carry it further.
+                    return false  // Reached its destination: no need to carry it further.
                 }
                 if (packet.isBroadcast && packet.originId != myId) deliverBroadcast(packet)
             }
 
             Packet.Type.ACK -> {
-                if (packet.payload.size != Packet.ID_SIZE) return
+                if (packet.payload.size != Packet.ID_SIZE) return false
                 val messageId = packet.payload.toHex()
                 // Remember who acknowledged, so the message is dropped if it shows up later.
                 // Keyed by acknowledger: a stranger's fake receipt can't cancel someone else's message.
@@ -247,17 +270,19 @@ class MeshRouter(
                     store.remove(messageId)
                     if (original.originId == myId) listener.onDelivered(messageId)
                 }
-                if (packet.destinationId == myId) return
+                if (packet.destinationId == myId) return false
             }
         }
-        relay(packet, fromLink)
+        return true
     }
 
-    private fun relay(packet: Packet, fromLink: String?) {
-        if (packet.hops + 1 > packet.maxHops) return
+    /** Store and forward. Returns false if the packet is at its hop limit and stops here. */
+    private fun relay(packet: Packet, fromLink: String?): Boolean {
+        if (packet.hops + 1 > packet.maxHops) return false
         val next = packet.withHops(packet.hops + 1)
         store.put(next)
         links.filter { it != fromLink }.forEach { sendPacket(it, next) }
+        return true
     }
 
     private fun deliverDirect(packet: Packet) {

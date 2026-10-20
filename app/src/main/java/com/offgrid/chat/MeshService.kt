@@ -49,8 +49,26 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
         fun isEnabled(context: Context) =
             context.getSharedPreferences("offgrid", MODE_PRIVATE).getBoolean("enabled", true)
 
+        val bluetoothPermissions: List<String>
+            get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                listOf(
+                    android.Manifest.permission.BLUETOOTH_SCAN,
+                    android.Manifest.permission.BLUETOOTH_ADVERTISE,
+                    android.Manifest.permission.BLUETOOTH_CONNECT,
+                )
+            } else {
+                listOf(android.Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+
+        fun hasPermissions(context: Context) = bluetoothPermissions.all {
+            context.checkSelfPermission(it) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+
+        /** Marks relaying as on and starts it, if Bluetooth permissions are granted. */
         fun start(context: Context) {
             context.getSharedPreferences("offgrid", MODE_PRIVATE).edit().putBoolean("enabled", true).apply()
+            // Android 14+ refuses a connected-device service without them (SecurityException).
+            if (!hasPermissions(context)) return
             val intent = Intent(context, MeshService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
             else context.startService(intent)
@@ -59,7 +77,10 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
 
     private val main = Handler(Looper.getMainLooper())
     /** All disk writes go through one background thread, in order. */
-    private val io = Executors.newSingleThreadExecutor()
+    private val ioThread = Executors.newSingleThreadExecutor()
+    // Late writes after shutdown are dropped rather than crashing.
+    private val io = java.util.concurrent.Executor { r -> runCatching { ioThread.execute(r) } }
+    private var initialized = false
     lateinit var router: MeshRouter
         private set
     lateinit var chats: ChatStore
@@ -82,7 +103,12 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
     override fun onCreate() {
         super.onCreate()
         createChannels()
-        goForeground()
+        // Permissions can be revoked while we're not running, and START_STICKY brings us back anyway.
+        val foreground = hasPermissions(this) && runCatching { goForeground() }.isSuccess
+        if (!foreground) {
+            stopSelf()
+            return
+        }
 
         chats = ChatStore(File(filesDir, "chat"), io)
         router = MeshRouter(loadIdentity(), FilePacketStore(File(filesDir, "packets"), io = io), this)
@@ -96,6 +122,7 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
         main.postDelayed(reannounce, ANNOUNCE_EVERY_MS)
         main.postDelayed(prune, PRUNE_EVERY_MS)
 
+        initialized = true
         Mesh.service = this
         Mesh.changed()
     }
@@ -103,10 +130,14 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
+        if (!initialized) {
+            super.onDestroy()
+            return
+        }
         main.removeCallbacksAndMessages(null)
         unregisterReceiver(bluetoothState)
         transport.stop()
-        io.shutdown()
+        ioThread.shutdown()
         Mesh.service = null
         Mesh.changed()
         super.onDestroy()

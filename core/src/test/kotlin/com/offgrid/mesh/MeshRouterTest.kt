@@ -274,6 +274,25 @@ class MeshRouterTest {
             .contentEquals(restored.sharedKeyWith(a.identity.publicEncoded)))
     }
 
+    @Test
+    fun deliveredMessagesAreNotResentOnReconnect() {
+        val net = SimNetwork()
+        val (a, b, c) = listOf("a", "b", "c").map { net.node(it) }
+        net.connect(b, c)
+        c.router.announce("Carol")
+        net.run()
+        net.connect(a, b)
+        a.router.sendText("hello", "Alice", toId = c.id)
+        net.run()
+        assertEquals(1, c.inbox.size)
+        // B still carries C's receipt; C must not get the message pushed back at every meeting.
+        net.disconnect(b, c)
+        val before = net.bytesSent
+        net.connect(b, c)
+        assertTrue(net.bytesSent - before < 300, "sent ${net.bytesSent - before}")
+        assertEquals(1, c.inbox.size)
+    }
+
     private fun forge(who: Identity, type: Packet.Type, dest: ByteArray, payload: ByteArray, now: Long): Packet {
         val id = Crypto.randomBytes(Packet.ID_SIZE)
         val unsigned = Packet(type, id, who.publicEncoded, dest, now, now + MeshRouter.HOUR, 0, 10, payload, ByteArray(0))
