@@ -64,7 +64,8 @@ class MeshRouter(
         /** Public messages are for the people around you, so they don't flood the whole country. */
         const val BROADCAST_LIFETIME = 12 * HOUR
         const val BROADCAST_MAX_HOPS = 10
-        const val MAX_TEXT_BYTES = 4000
+        // Small enough that a private message still fits in 8 LoRa pieces.
+        const val MAX_TEXT_BYTES = 1000
         private const val LINK_PACKET: Byte = 1
         private const val LINK_INVENTORY: Byte = 2
         private const val SHORT_ID = 8

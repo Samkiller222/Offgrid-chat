@@ -415,6 +415,19 @@ class MeshRouterTest {
         assertTrue(delivered >= sent.size - 1, "delivered $delivered of ${sent.size}")
     }
 
+    @Test
+    fun longestPrivateMessageFitsOverLora() {
+        val net = SimNetwork()
+        val (a, b) = listOf("a", "b").map { net.node(it) }
+        net.connect(a, b)
+        b.router.announce("B".repeat(40))
+        net.run()
+        a.router.sendText("é".repeat(MeshRouter.MAX_TEXT_BYTES / 2), "A".repeat(40), b.id)
+        val packet = a.store.all().single { it.type == Packet.Type.MESSAGE }
+        val linkBlob = byteArrayOf(1) + packet.encode()
+        LoraFragmenter().split(linkBlob)  // throws if it needs more than MAX_PIECES
+    }
+
     private fun forge(who: Identity, type: Packet.Type, dest: ByteArray, payload: ByteArray, now: Long): Packet {
         val id = Crypto.randomBytes(Packet.ID_SIZE)
         val unsigned = Packet(type, id, who.publicEncoded, dest, now, now + MeshRouter.HOUR, 0, 10, payload, ByteArray(0))
