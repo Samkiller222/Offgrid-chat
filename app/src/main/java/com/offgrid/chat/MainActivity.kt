@@ -35,6 +35,7 @@ class MainActivity : Activity() {
     private lateinit var toggle: Button
     /** Stop re-asking in a loop after a denial; the user fixes it in Settings. */
     private var permissionsDenied = false
+    private var askedBluetoothOn = false
     private val refresh: () -> Unit = { render() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -128,6 +129,11 @@ class MainActivity : Activity() {
         render()
     }
 
+    override fun onStop() {
+        askedBluetoothOn = false
+        super.onStop()
+    }
+
     override fun onPause() {
         Mesh.unlisten(refresh)
         super.onPause()
@@ -155,7 +161,9 @@ class MainActivity : Activity() {
             status.text = "This phone has no Bluetooth."
             return
         }
-        if (!adapter.isEnabled) {
+        if (!adapter.isEnabled && !askedBluetoothOn) {
+            // Once per visit to this screen, so tapping "Deny" doesn't bring it straight back.
+            askedBluetoothOn = true
             @Suppress("MissingPermission")
             startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
         }
@@ -189,9 +197,14 @@ class MainActivity : Activity() {
         val radio = when (s.lora.state) {
             LoraRadio.State.CONNECTED -> "LoRa radio: ${s.lora.deviceName} connected"
             LoraRadio.State.CONNECTING -> "LoRa radio: connecting to ${s.lora.deviceName}…"
-            LoraRadio.State.OFF -> "LoRa radio: none"
+            LoraRadio.State.OFF -> s.lora.problem?.let { "LoRa radio: $it" } ?: "LoRa radio: none"
         }
-        status.text = "Phones linked right now: ${s.linkCount}   ·   Carrying ${s.router.carriedCount()} packets\n$radio"
+        val warning = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S && !locationOn()) {
+            "\n⚠ Turn on Location: this Android version needs it to find nearby phones."
+        } else {
+            ""
+        }
+        status.text = "Phones linked right now: ${s.linkCount}   ·   Carrying ${s.router.carriedCount()} packets\n$radio$warning"
 
         val rows = mutableListOf<Row>()
         val everyoneLast = s.chats.lastMessage(ChatStore.EVERYONE)
@@ -274,6 +287,13 @@ class MainActivity : Activity() {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    private fun locationOn(): Boolean {
+        val lm = getSystemService(android.location.LocationManager::class.java) ?: return true
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) lm.isLocationEnabled
+        else lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER) ||
+            lm.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()

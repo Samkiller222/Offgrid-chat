@@ -31,6 +31,8 @@ class ChatStore(dir: File, private val io: Executor = Executor { it.run() }) {
 
     private val messages = LinkedHashMap<String, StoredMessage>()
     private val contacts = LinkedHashMap<String, Contact>()
+    /** Newest message per conversation, so the home screen doesn't scan everything on each refresh. */
+    private val latest = HashMap<String, StoredMessage>()
 
     init {
         dir.mkdirs()
@@ -39,6 +41,7 @@ class ChatStore(dir: File, private val io: Executor = Executor { it.run() }) {
             for (i in 0 until arr.length()) {
                 val m = messageFrom(arr.getJSONObject(i))
                 messages[m.message.id] = m
+                noteLatest(m)
             }
         }
         runCatching {
@@ -61,12 +64,19 @@ class ChatStore(dir: File, private val io: Executor = Executor { it.run() }) {
     fun messages(conversation: String): List<StoredMessage> =
         messages.values.filter { it.conversation == conversation }.sortedBy { it.message.sentAt }
 
-    fun lastMessage(conversation: String): StoredMessage? = messages(conversation).lastOrNull()
+    fun lastMessage(conversation: String): StoredMessage? = latest[conversation]
+
+    private fun noteLatest(m: StoredMessage) {
+        val cur = latest[m.conversation]
+        if (cur == null || cur.message.sentAt <= m.message.sentAt) latest[m.conversation] = m
+    }
 
     /** Returns false if we already had it (the mesh can deliver the same message again after a restart). */
     fun add(message: ChatMessage): Boolean {
         if (message.id in messages) return false
-        messages[message.id] = StoredMessage(message, delivered = false)
+        val stored = StoredMessage(message, delivered = false)
+        messages[message.id] = stored
+        noteLatest(stored)
         while (messages.size > MAX_MESSAGES) messages.remove(messages.keys.first())
         saveMessages()
         return true
@@ -75,7 +85,9 @@ class ChatStore(dir: File, private val io: Executor = Executor { it.run() }) {
     fun markDelivered(id: String) {
         val m = messages[id] ?: return
         if (m.delivered) return
-        messages[id] = m.copy(delivered = true)
+        val updated = m.copy(delivered = true)
+        messages[id] = updated
+        if (latest[updated.conversation]?.message?.id == id) latest[updated.conversation] = updated
         saveMessages()
     }
 
@@ -86,10 +98,14 @@ class ChatStore(dir: File, private val io: Executor = Executor { it.run() }) {
         saveContacts()
     }
 
+    /** Snapshot here, build the JSON and write on the I/O thread: it can be thousands of messages. */
     private fun saveMessages() {
-        val arr = JSONArray()
-        messages.values.forEach { arr.put(messageTo(it)) }
-        writeAtomically(messagesFile, arr.toString())
+        val snapshot = messages.values.toList()
+        io.execute {
+            val arr = JSONArray()
+            snapshot.forEach { arr.put(messageTo(it)) }
+            write(messagesFile, arr.toString())
+        }
     }
 
     private fun saveContacts() {
@@ -103,7 +119,9 @@ class ChatStore(dir: File, private val io: Executor = Executor { it.run() }) {
         writeAtomically(contactsFile, arr.toString())
     }
 
-    private fun writeAtomically(file: File, text: String) = io.execute {
+    private fun writeAtomically(file: File, text: String) = io.execute { write(file, text) }
+
+    private fun write(file: File, text: String) {
         val tmp = File(file.parentFile, file.name + ".tmp")
         tmp.writeText(text)
         tmp.renameTo(file)

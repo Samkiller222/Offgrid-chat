@@ -97,7 +97,7 @@ class BleTransport(
 
     private inner class ClientLink(val gatt: BluetoothGatt, val token: Int) : Link("c:${gatt.device.address}") {
         var rx: BluetoothGattCharacteristic? = null
-        val openedAt = SystemClock.elapsedRealtime()
+        var setupStarted = false
 
         override fun sendFrame(frame: ByteArray): Boolean {
             val c = rx ?: return false
@@ -112,6 +112,7 @@ class BleTransport(
 
     private inner class ServerLink(val device: BluetoothDevice) : Link("s:${device.address}") {
         var tx: BluetoothGattCharacteristic? = null
+        val openedAt = SystemClock.elapsedRealtime()
 
         override fun sendFrame(frame: ByteArray): Boolean {
             val s = server ?: return false
@@ -146,6 +147,8 @@ class BleTransport(
     private val connectingTokens = HashMap<Int, Long>()        // token -> started at
     private val pendingGatts = HashMap<Int, BluetoothGatt>()   // token -> dial in progress
     private val backoff = HashMap<Int, Pair<Long, Long>>()     // token -> (retry after, delay)
+    /** Inbound connections we closed as duplicates; ignore their late writes until they disconnect. */
+    private val rejectedServers = HashSet<String>()
 
     val linkCount: Int get() = links.values.count { it.ready }
 
@@ -299,8 +302,9 @@ class BleTransport(
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             post {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    serverLinks.getOrPut(device.address) { ServerLink(device) }
+                    if (device.address !in rejectedServers) serverLinks.getOrPut(device.address) { ServerLink(device) }
                 } else {
+                    rejectedServers.remove(device.address)
                     serverLinks.remove(device.address)?.let { dropLink(it) }
                 }
             }
@@ -327,6 +331,7 @@ class BleTransport(
             if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             val uuid = characteristic.uuid
             post {
+                if (device.address in rejectedServers) return@post
                 val l = serverLinks.getOrPut(device.address) { ServerLink(device) }
                 when (uuid) {
                     HELLO_UUID -> if (value.size == TOKEN_SIZE) {
@@ -344,6 +349,7 @@ class BleTransport(
                                 mine.close()
                             } else {
                                 serverLinks.remove(device.address)
+                                rejectedServers.add(device.address)
                                 dropLink(l)
                                 l.close()
                             }
@@ -367,6 +373,7 @@ class BleTransport(
             val enable = value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
             val tx = descriptor.characteristic
             post {
+                if (device.address in rejectedServers) return@post
                 val l = serverLinks.getOrPut(device.address) { ServerLink(device) }
                 if (enable && descriptor.uuid == CCCD_UUID) {
                     l.tx = tx
@@ -410,6 +417,14 @@ class BleTransport(
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartFailure(errorCode: Int) {
             MeshLog.e(TAG, "Advertising failed: $errorCode")
+            if (errorCode != ADVERTISE_FAILED_ALREADY_STARTED) {
+                main.postDelayed({
+                    if (running) {
+                        runCatching { adapter?.bluetoothLeAdvertiser?.stopAdvertising(this) }
+                        startAdvertising()
+                    }
+                }, 30_000)
+            }
         }
     }
 
@@ -509,6 +524,12 @@ class BleTransport(
                 }
                 connectFailed(t)
             }
+            // Inbound connections that never finished setup would block us from dialing that peer.
+            serverLinks.values.filter { !it.ready && now - it.openedAt > CONNECT_TIMEOUT_MS }.forEach { l ->
+                MeshLog.w(TAG, "inbound setup timeout ${l.device.address}")
+                serverLinks.remove(l.device.address)
+                l.close()
+            }
             sightings.entries.removeAll { now - it.value.lastSeen > SEEN_TIMEOUT_MS }
             sightings.forEach { (t, s) -> maybeConnect(t, s, now) }
             main.postDelayed(this, 5_000)
@@ -520,35 +541,52 @@ class BleTransport(
     private fun clientCallback(peerToken: Int) = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             post {
-                if (pendingGatts[peerToken] === gatt) pendingGatts.remove(peerToken)
                 val address = gatt.device.address
+                val pending = pendingGatts[peerToken] === gatt
+                val current = clientLinks[address]?.takeIf { it.gatt === gatt }
                 if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
-                    if (!running || isLinked(peerToken)) {
-                        gatt.disconnect(); gatt.close(); connectingTokens.remove(peerToken)
+                    // A dial we already abandoned (cancelled, timed out) connecting late: discard it.
+                    if (!pending || isLinked(peerToken)) {
+                        if (pending) { pendingGatts.remove(peerToken); connectingTokens.remove(peerToken) }
+                        gatt.disconnect(); gatt.close()
                         return@post
                     }
+                    pendingGatts.remove(peerToken)
+                    // Same address from an earlier run of the peer's app: close the old one.
+                    clientLinks.remove(address)?.let { old -> dropLink(old); old.close() }
                     clientLinks[address] = ClientLink(gatt, peerToken)
-                    if (!gatt.requestMtu(517)) gatt.discoverServices()
+                    if (!gatt.requestMtu(517)) startSetup(gatt)
                 } else {
-                    val l = clientLinks.remove(address)
-                    if (l != null) dropLink(l)
                     gatt.close()
-                    if (l == null || !l.ready) connectFailed(peerToken) else backoff.remove(peerToken)
-                    connectingTokens.remove(peerToken)
+                    when {
+                        current != null -> {
+                            clientLinks.remove(address)
+                            dropLink(current)
+                            if (current.ready) backoff.remove(peerToken) else connectFailed(peerToken)
+                            connectingTokens.remove(peerToken)
+                        }
+                        pending -> {
+                            pendingGatts.remove(peerToken)
+                            connectFailed(peerToken)
+                        }
+                        // else: a stale callback from a gatt we already closed; nothing to do.
+                    }
                 }
             }
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             post {
-                clientLinks[gatt.device.address]?.mtu = if (status == BluetoothGatt.GATT_SUCCESS) mtu else 23
-                gatt.discoverServices()
+                val l = linkFor(gatt) ?: return@post
+                if (status == BluetoothGatt.GATT_SUCCESS) l.mtu = mtu
+                // The peer may renegotiate MTU later; only run setup once.
+                startSetup(gatt)
             }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             post {
-                val l = clientLinks[gatt.device.address] ?: return@post
+                val l = linkFor(gatt) ?: return@post
                 val service = gatt.getService(SERVICE_UUID)
                 val rx = service?.getCharacteristic(RX_UUID)
                 val hello = service?.getCharacteristic(HELLO_UUID)
@@ -565,7 +603,7 @@ class BleTransport(
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
             val uuid = characteristic.uuid
             post {
-                val l = clientLinks[gatt.device.address] ?: return@post
+                val l = linkFor(gatt) ?: return@post
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     gatt.disconnect()
                     return@post
@@ -576,7 +614,7 @@ class BleTransport(
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             post {
-                val l = clientLinks[gatt.device.address] ?: return@post
+                val l = linkFor(gatt) ?: return@post
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     gatt.disconnect()
                     return@post
@@ -599,8 +637,17 @@ class BleTransport(
         }
 
         private fun onNotified(gatt: BluetoothGatt, value: ByteArray) {
-            post { clientLinks[gatt.device.address]?.let { receiveFrame(it, value) } }
+            post { linkFor(gatt)?.let { receiveFrame(it, value) } }
         }
+    }
+
+    private fun linkFor(gatt: BluetoothGatt): ClientLink? = clientLinks[gatt.device.address]?.takeIf { it.gatt === gatt }
+
+    private fun startSetup(gatt: BluetoothGatt) {
+        val l = linkFor(gatt) ?: return
+        if (l.setupStarted) return
+        l.setupStarted = true
+        if (!gatt.discoverServices()) gatt.disconnect()
     }
 
     private fun subscribe(gatt: BluetoothGatt) {

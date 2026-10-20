@@ -52,6 +52,8 @@ class LoraRadio(
         private val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         private const val RECONNECT_MS = 10_000L
         private const val MAX_QUEUE = 200
+        /** Covers the config download too, which can take a while on a busy mesh. */
+        private const val CONNECT_TIMEOUT_MS = 60_000L
     }
 
     enum class State { OFF, CONNECTING, CONNECTED }
@@ -85,12 +87,18 @@ class LoraRadio(
         private set
     var deviceName: String? = null
         private set
+    /** Something only the user can fix (e.g. pairing cancelled), shown on the home screen. */
+    var problem: String? = null
+        private set
+    private var authFailures = 0
 
     /** Connect to the board at [address] and keep reconnecting until [disconnect]. */
     fun connect(address: String) {
         if (this.address == address && state != State.OFF) return
         disconnect()
         this.address = address
+        problem = null
+        authFailures = 0
         open()
     }
 
@@ -134,7 +142,7 @@ class LoraRadio(
             return
         }
         gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
-        if (gatt == null) scheduleReconnect()
+        if (gatt == null) scheduleReconnect() else main.postDelayed(connectTimeout, CONNECT_TIMEOUT_MS)
     }
 
     private fun teardown() {
@@ -149,6 +157,7 @@ class LoraRadio(
         txFree = 2
         stopWatchingBonding()
         main.removeCallbacks(txRetry)
+        main.removeCallbacks(connectTimeout)
         state = State.OFF
         if (wasUp) events.onLinkDown(LINK)
         Mesh.changed()
@@ -160,7 +169,8 @@ class LoraRadio(
         if (bondReceiver != null) return
         val r = object : BroadcastReceiver() {
             override fun onReceive(c: Context, intent: Intent) {
-                val d: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                // The typed overload is unreliable on API 33, so only use it from 34.
+                val d: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
                 } else {
                     @Suppress("DEPRECATION")
@@ -169,7 +179,15 @@ class LoraRadio(
                 if (d?.address != address) return
                 when (intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1)) {
                     BluetoothDevice.BOND_BONDED -> { stopWatchingBonding(); state = State.OFF; open() }
-                    BluetoothDevice.BOND_NONE -> { stopWatchingBonding(); scheduleReconnect() }
+                    BluetoothDevice.BOND_NONE -> {
+                        // Cancelled or wrong PIN. Don't pop the dialog again on a timer.
+                        val keep = address
+                        teardown()
+                        address = keep
+                        problem = "Pairing with the radio didn't finish. Tap LoRa radio to try again."
+                        MeshLog.w(TAG, "pairing cancelled or failed")
+                        Mesh.changed()
+                    }
                 }
             }
         }
@@ -180,6 +198,13 @@ class LoraRadio(
     private fun stopWatchingBonding() {
         bondReceiver?.let { runCatching { context.unregisterReceiver(it) } }
         bondReceiver = null
+    }
+
+    private val connectTimeout = Runnable {
+        if (state == State.CONNECTING) {
+            MeshLog.w(TAG, "radio didn't finish connecting, retrying")
+            scheduleReconnect()
+        }
     }
 
     private val reconnect = Runnable { if (address != null && state == State.OFF) open() }
@@ -297,6 +322,8 @@ class LoraRadio(
             }
         }
         if (msg.configCompleteId == configNonce.toLong() && state == State.CONNECTING) {
+            main.removeCallbacks(connectTimeout)
+            authFailures = 0
             MeshLog.i(TAG, "radio $deviceName ready")
             state = State.CONNECTED
             events.onLinkUp(LINK)
@@ -314,7 +341,21 @@ class LoraRadio(
     /** Auth/encryption errors mean the bond is gone or refused: start over (which re-pairs). */
     private fun failed(status: Int): Boolean {
         if (status != 5 && status != 15 && status != 137) return false
+        // Typically the board was reset or reflashed and forgot us, while the phone still
+        // has the old bond. Drop the phone's side so the next attempt pairs afresh.
+        authFailures++
+        val device = gatt?.device
+        if (authFailures > 2) {
+            val keep = address
+            teardown()
+            address = keep
+            problem = "The radio won't accept this phone. Forget it in Bluetooth settings, then pick it again."
+            MeshLog.w(TAG, "radio keeps refusing us ($status)")
+            Mesh.changed()
+            return true
+        }
         MeshLog.w(TAG, "radio refused us ($status), re-pairing")
+        device?.let { d -> runCatching { d.javaClass.getMethod("removeBond").invoke(d) } }
         scheduleReconnect()
         return true
     }

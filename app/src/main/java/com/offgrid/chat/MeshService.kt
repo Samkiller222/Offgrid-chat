@@ -138,7 +138,12 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
         Mesh.changed()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Every startForegroundService() call must be answered with startForeground(), even
+        // when we're already running (e.g. the toggle and the home screen both started us).
+        if (initialized) runCatching { goForeground() }
+        return START_STICKY
+    }
 
     override fun onDestroy() {
         if (!initialized) {
@@ -316,7 +321,14 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
             .setOngoing(true)
             .build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFY_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            // Android 10/11 scan with location permission, so they need the location type to keep
+            // scanning with the screen off. From 12, Bluetooth permissions replace that.
+            val type = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            }
+            startForeground(NOTIFY_ID, notification, type)
         } else {
             startForeground(NOTIFY_ID, notification)
         }
