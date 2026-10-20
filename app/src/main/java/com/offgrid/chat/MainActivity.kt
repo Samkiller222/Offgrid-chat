@@ -18,6 +18,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
+import android.widget.Toast
 
 /**
  * Home screen: who you are, how many phones are linked right now, and your conversations.
@@ -95,6 +96,19 @@ class MainActivity : Activity() {
                         orientation = LinearLayout.HORIZONTAL
                         addView(rename)
                         addView(toggle)
+                    },
+                )
+                addView(
+                    LinearLayout(this@MainActivity).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        addView(Button(this@MainActivity).apply {
+                            text = "Share my code"
+                            setOnClickListener { shareCode() }
+                        })
+                        addView(Button(this@MainActivity).apply {
+                            text = "Add by code"
+                            setOnClickListener { askCode() }
+                        })
                     },
                 )
                 addView(
@@ -178,6 +192,31 @@ class MainActivity : Activity() {
         }
         adapter.clear()
         adapter.addAll(rows)
+    }
+
+    private fun shareCode() {
+        val s = Mesh.service ?: return
+        startActivity(
+            Intent.createChooser(
+                Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, s.myContactCode),
+                "Share your OffGrid code",
+            ),
+        )
+    }
+
+    private fun askCode() {
+        val s = Mesh.service ?: return
+        val input = EditText(this).apply { hint = "offgrid:…" }
+        AlertDialog.Builder(this)
+            .setTitle("Paste someone's OffGrid code")
+            .setView(input)
+            .setPositiveButton("Add") { _, _ ->
+                val c = s.addContactFromCode(input.text.toString())
+                Toast.makeText(this, if (c == null) "That code isn't valid" else "Added ${c.name}", Toast.LENGTH_SHORT)
+                    .show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun askName() {

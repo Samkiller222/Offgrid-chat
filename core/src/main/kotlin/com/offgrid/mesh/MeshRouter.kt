@@ -80,6 +80,7 @@ class MeshRouter(
     private val contacts = HashMap<String, Contact>()
 
     val myId: String get() = identity.id
+    val myPublicKey: ByteArray get() = identity.publicEncoded
     val linkCount: Int get() = links.size
 
     init {

@@ -121,6 +121,31 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
         Mesh.changed()
     }
 
+    /**
+     * A code you can text, show or read out to someone, so they can message you before
+     * your announcement has reached them through the mesh.
+     */
+    val myContactCode: String
+        get() = "offgrid:" + Base64.encodeToString(router.myPublicKey, Base64.NO_WRAP or Base64.URL_SAFE) +
+            "#" + myName
+
+    /** Returns the added contact, or null if the code isn't valid. */
+    fun addContactFromCode(code: String): Contact? {
+        val body = code.trim().substringAfter("offgrid:", "")
+        if (body.isEmpty()) return null
+        val key = runCatching {
+            Base64.decode(body.substringBefore("#"), Base64.NO_WRAP or Base64.URL_SAFE)
+        }.getOrNull() ?: return null
+        if (runCatching { com.offgrid.mesh.Crypto.publicKey(key) }.isFailure) return null
+        val name = body.substringAfter("#", "").trim().take(40).ifEmpty { "Unknown" }
+        val contact = Contact(com.offgrid.mesh.NodeId.of(key), name, key, System.currentTimeMillis())
+        if (contact.id == router.myId) return null
+        router.rememberContact(contact)
+        chats.putContact(contact)
+        Mesh.changed()
+        return contact
+    }
+
     // ------------------------------------------------------------------ transport -> router
 
     override fun onLinkUp(link: String) {
