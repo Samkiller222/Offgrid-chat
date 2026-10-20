@@ -100,6 +100,10 @@ class MainActivity : Activity() {
                             text = "Add by code"
                             setOnClickListener { askCode() }
                         })
+                        addView(Button(this@MainActivity).apply {
+                            text = "LoRa radio"
+                            setOnClickListener { pickRadio() }
+                        })
                     },
                 )
                 addView(
@@ -178,7 +182,12 @@ class MainActivity : Activity() {
             return
         }
         me.text = "${s.myName}  ·  id ${s.router.myId.take(8)}"
-        status.text = "Phones linked right now: ${s.linkCount}   ·   Carrying ${s.router.carriedCount()} packets"
+        val radio = when (s.lora.state) {
+            LoraRadio.State.CONNECTED -> "LoRa radio: ${s.lora.deviceName} connected"
+            LoraRadio.State.CONNECTING -> "LoRa radio: connecting to ${s.lora.deviceName}…"
+            LoraRadio.State.OFF -> "LoRa radio: none"
+        }
+        status.text = "Phones linked right now: ${s.linkCount}   ·   Carrying ${s.router.carriedCount()} packets\n$radio"
 
         val rows = mutableListOf<Row>()
         val everyoneLast = s.chats.lastMessage(ChatStore.EVERYONE)
@@ -196,6 +205,32 @@ class MainActivity : Activity() {
         }
         adapter.clear()
         adapter.addAll(rows)
+    }
+
+    /** Find Meshtastic boards nearby and let the user pick one (or stop using one). */
+    private fun pickRadio() {
+        val s = Mesh.service ?: return
+        val found = mutableListOf<LoraRadio.Found>()
+        val names = ArrayAdapter<String>(this, android.R.layout.simple_list_item_1)
+        names.add("Don't use a LoRa radio")
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Searching for Meshtastic radios…")
+            .setAdapter(names) { _, which ->
+                if (which == 0) s.useLoraRadio(null) else s.useLoraRadio(found[which - 1].address)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+        s.lora.scan(
+            onFound = {
+                found += it
+                names.add("${it.name}  (${it.address})")
+            },
+            onDone = {
+                if (dialog.isShowing) {
+                    dialog.setTitle(if (found.isEmpty()) "No radios found. Is it on and nearby?" else "Pick your radio")
+                }
+            },
+        )
     }
 
     private fun shareCode() {

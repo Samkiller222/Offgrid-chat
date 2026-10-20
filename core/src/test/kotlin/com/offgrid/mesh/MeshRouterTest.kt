@@ -293,6 +293,63 @@ class MeshRouterTest {
         assertEquals(1, c.inbox.size)
     }
 
+    @Test
+    fun meshtasticEncodingMatchesProtobuf() {
+        // ToRadio { want_config_id: 1 } is tag 0x18, value 1.
+        assertTrue(Meshtastic.wantConfig(1).contentEquals(byteArrayOf(0x18, 0x01)))
+        val toRadio = Meshtastic.broadcast(byteArrayOf(9, 8, 7), packetId = 0x01020304)
+        // ToRadio.packet (1) -> MeshPacket: to=0xFFFFFFFF (fixed32 #2), decoded (#4), id (#6)
+        val packet = Meshtastic.ProtoReader(toRadio).fields().single { it.number == 1 }.bytes!!
+        val fields = Meshtastic.ProtoReader(packet).fields()
+        assertEquals(0xFFFFFFFFL, fields.single { it.number == 2 }.value)
+        assertEquals(0x01020304L, fields.single { it.number == 6 }.value)
+        // The radio echoes packets back inside FromRadio.packet (#2) with a from field.
+        val meshPacket = Meshtastic.ProtoWriter().fixed32(1, 0xDEADBEEFL)
+            .message(4, fields.single { it.number == 4 }.bytes!!).bytes()
+        val fromRadio = Meshtastic.ProtoWriter().varint(1, 5).message(2, meshPacket).bytes()
+        val got = Meshtastic.parseFromRadio(fromRadio)!!
+        assertEquals(0xDEADBEEFL, got.fromNode)
+        assertTrue(got.payload.contentEquals(byteArrayOf(9, 8, 7)))
+        // Config and other traffic is ignored, garbage doesn't crash.
+        assertNull(Meshtastic.parseFromRadio(Meshtastic.ProtoWriter().varint(7, 42).bytes()))
+        assertNull(Meshtastic.parseFromRadio(byteArrayOf(0x12, 0x7F, 1)))
+    }
+
+    @Test
+    fun loraFragmentsReassembleOutOfOrderAcrossSenders() {
+        val f = LoraFragmenter()
+        val a = Crypto.randomBytes(700)
+        val b = Crypto.randomBytes(300)
+        val pa = f.split(a)
+        val pb = f.split(b)
+        assertTrue(pa.all { it.size <= Meshtastic.MAX_PAYLOAD })
+        val r = LoraFragmenter()
+        val out = mutableListOf<ByteArray>()
+        (pa.reversed().map { 1L to it } + pb.map { 2L to it } + (1L to pa[0]))
+            .shuffled(kotlin.random.Random(1))
+            .forEach { (sender, piece) -> r.accept(sender, piece)?.let { out += it } }
+        assertEquals(2, out.size)
+        assertTrue(out.any { it.contentEquals(a) } && out.any { it.contentEquals(b) })
+    }
+
+    @Test
+    fun loraLinkSkipsInventoryAndAnnouncementsFromOthers() {
+        val net = SimNetwork()
+        val (a, b) = listOf("a", "b").map { net.node(it) }
+        b.router.announce("Bob")
+        a.router.shouldSend = { link, p -> link != "b" || p.type != Packet.Type.ANNOUNCE || p.originId == a.id }
+        net.connect(b, a)       // b syncs to a normally, a learns Bob
+        net.disconnect(a, b)
+        val before = net.bytesSent
+        a.router.linkUp("b", sync = false)
+        assertEquals(before, net.bytesSent, "no inventory on a no-sync link")
+        a.router.sendText("over lora", "Alice")
+        net.run()
+        assertEquals("over lora", b.inbox.single().text)
+        // a never forwards Bob's announcement back over the LoRa link
+        assertTrue(a.store.all().any { it.type == Packet.Type.ANNOUNCE })
+    }
+
     private fun forge(who: Identity, type: Packet.Type, dest: ByteArray, payload: ByteArray, now: Long): Packet {
         val id = Crypto.randomBytes(Packet.ID_SIZE)
         val unsigned = Packet(type, id, who.publicEncoded, dest, now, now + MeshRouter.HOUR, 0, 10, payload, ByteArray(0))

@@ -75,6 +75,9 @@ class MeshRouter(
 
     var transport: Transport? = null
 
+    /** Per-link filter, e.g. to keep chatty announcements off a LoRa link. */
+    var shouldSend: (link: String, packet: Packet) -> Boolean = { _, _ -> true }
+
     private val links = LinkedHashSet<String>()
     private val seen = LinkedHashSet<String>()
     private val delivered = LinkedHashSet<String>()     // message ids we've seen an ACK for
@@ -114,9 +117,13 @@ class MeshRouter(
 
     // ------------------------------------------------------------------ links
 
-    fun linkUp(link: String) {
+    /**
+     * A neighbour became reachable. [sync] swaps inventories so each side gets what it missed;
+     * turn it off for slow broadcast radios (LoRa) where that would eat the airtime budget.
+     */
+    fun linkUp(link: String, sync: Boolean = true) {
         if (!links.add(link)) return
-        sendInventory(link)
+        if (sync) sendInventory(link)
     }
 
     fun linkDown(link: String) {
@@ -158,6 +165,7 @@ class MeshRouter(
     }
 
     private fun sendPacket(link: String, packet: Packet) {
+        if (!shouldSend(link, packet)) return
         transport?.send(link, byteArrayOf(LINK_PACKET) + packet.encode())
     }
 

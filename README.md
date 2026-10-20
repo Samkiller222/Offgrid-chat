@@ -21,9 +21,24 @@ Messages live for 3 days and up to 64 hops. This is the same idea as Bridgefy, B
 Bitchat and Apple's Find My network, minus the internet backbone Find My relies on.
 
 **Range reality check:** Bluetooth alone only covers long distances if enough people
-nearby run the app. For long range with few users, the plan is a second transport using
-LoRa radios (Meshtastic boards, several km per hop). The mesh core doesn't care which
-radio carries the bytes, so LoRa plugs in next to Bluetooth.
+nearby run the app. For long range with few users, pair the phone with a LoRa radio (below).
+
+## Long range: LoRa radios (experimental, untested on hardware)
+
+Pair the phone with a cheap Meshtastic LoRa board and the app also sends messages over LoRa,
+several km per hop. In the EU (incl. Malta) use the **868 MHz** version, e.g. Heltec
+WiFi LoRa 32 V3 or Wireless Stick Lite V3.
+
+1. Flash Meshtastic firmware on the board (flasher.meshtastic.org) and set region EU_868
+   once with the Meshtastic app. Then close the Meshtastic app so it releases the board.
+2. In OffGrid Chat tap **LoRa radio**, pick the board. Android asks to pair; boards without
+   a screen use PIN 123456 unless changed.
+
+How it works: our signed packets travel as Meshtastic PRIVATE_APP broadcasts (split into
+≤220-byte pieces), so any Meshtastic node, including public ones, floods them onward. To
+save airtime (EU868 is ~1% duty cycle) only messages, receipts and your own announcement go
+over LoRa, and phones don't swap inventories over it. A phone with a radio bridges: what it
+hears over LoRa it relays to nearby Bluetooth phones and vice versa.
 
 ## Privacy and security
 

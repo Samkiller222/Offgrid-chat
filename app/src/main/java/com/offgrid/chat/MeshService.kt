@@ -86,6 +86,8 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
     lateinit var chats: ChatStore
         private set
     private lateinit var transport: BleTransport
+    lateinit var lora: LoraRadio
+        private set
     private var nextNotificationId = 100
 
     val linkCount: Int get() = if (::transport.isInitialized) transport.linkCount else 0
@@ -114,7 +116,16 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
         router = MeshRouter(loadIdentity(), FilePacketStore(File(filesDir, "packets"), io = io), this)
         chats.contacts().forEach { router.rememberContact(it) }
         transport = BleTransport(this, this)
-        router.transport = transport
+        lora = LoraRadio(this, this)
+        router.transport = com.offgrid.mesh.Transport { link, bytes ->
+            if (link == LoraRadio.LINK) lora.send(bytes) else transport.send(link, bytes)
+        }
+        // LoRa airtime is precious: only messages, receipts and our own announcement go over it.
+        router.shouldSend = { link, packet ->
+            link != LoraRadio.LINK || packet.type != com.offgrid.mesh.Packet.Type.ANNOUNCE ||
+                packet.originId == router.myId
+        }
+        prefs().getString("loraAddress", null)?.let { lora.connect(it) }
 
         registerReceiver(bluetoothState, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
         transport.start()
@@ -137,6 +148,7 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
         main.removeCallbacksAndMessages(null)
         unregisterReceiver(bluetoothState)
         transport.stop()
+        lora.disconnect()
         ioThread.shutdown()
         Mesh.service = null
         Mesh.changed()
@@ -177,10 +189,18 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
         return contact
     }
 
+    /** Pair with a Meshtastic LoRa board (or pass null to stop using one). Remembered across restarts. */
+    fun useLoraRadio(address: String?) {
+        prefs().edit().putString("loraAddress", address).apply()
+        if (address == null) lora.disconnect() else lora.connect(address)
+        Mesh.changed()
+    }
+
     // ------------------------------------------------------------------ transport -> router
 
     override fun onLinkUp(link: String) {
-        router.linkUp(link)
+        router.linkUp(link, sync = link != LoraRadio.LINK)
+        if (link == LoraRadio.LINK) router.announce(myName)  // let LoRa-side people find us
         Mesh.changed()
     }
 
@@ -233,9 +253,13 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
     private val bluetoothState = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1)) {
-                BluetoothAdapter.STATE_ON -> transport.start()
+                BluetoothAdapter.STATE_ON -> {
+                    transport.start()
+                    prefs().getString("loraAddress", null)?.let { lora.connect(it) }
+                }
                 BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> {
                     transport.stop()
+                    lora.disconnect()
                     Mesh.changed()
                 }
             }
