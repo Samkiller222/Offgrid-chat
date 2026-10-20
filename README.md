@@ -70,14 +70,23 @@ Key files:
 - `app/.../BleTransport.kt` BLE advertising, scanning, GATT links, chunking
 - `app/.../MeshService.kt` foreground service that keeps relaying with the screen off
 
-## Build and run
+## Try it on two phones
 
-Open the folder in Android Studio and run on two or more real phones (Bluetooth doesn't
-work in the emulator). Android 8.0 (API 26) or newer.
+1. Get the APK: on GitHub open **Actions → Build →** the latest green run, download
+   `offgrid-chat-debug-apk`, unzip, and copy the `.apk` to each phone. (Or open the project
+   in Android Studio and press Run.) Android 8.0 or newer, real phones only: Bluetooth doesn't
+   work in the emulator.
+2. Install it on both phones (allow "install unknown apps" for your file manager or browser).
+3. Open the app, allow Nearby devices (Bluetooth) and notifications. On Android 10/11 also
+   turn Location on.
+4. Within a few seconds each phone shows "Phones linked right now: 1" and the other person
+   appears in the list. Tap them to send a private message, or use **Everyone**.
+5. To test relaying, use three phones: put A and C far apart (or in different rooms with
+   walls between) and B in the middle. To test carrying, send from A while C is away, walk B
+   from A to C.
+6. If something doesn't work, open **Debug** on each phone and tap **Share log**.
 
-On first launch allow Bluetooth ("Nearby devices") and notifications. People show up in
-the list once their announcement reaches you through the mesh; tap one to message them,
-or use "Everyone" to talk to all phones in reach.
+## Build
 
 Run the mesh core tests on any machine with a JDK:
 
