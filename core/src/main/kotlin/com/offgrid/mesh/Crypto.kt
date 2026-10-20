@@ -88,9 +88,9 @@ object Crypto {
     }
 }
 
-/** A person's mesh address: the first 8 bytes of the SHA-256 of their public key, as hex. */
+/** A person's mesh address: the first 16 bytes of the SHA-256 of their public key, as hex. */
 object NodeId {
-    const val SIZE = 8
+    const val SIZE = 16
 
     fun bytesOf(publicKey: ByteArray): ByteArray = Crypto.sha256(publicKey).copyOf(SIZE)
 
@@ -104,7 +104,10 @@ class Identity(private val keyPair: KeyPair) {
     val id: String = NodeId.of(publicEncoded)
     val idBytes: ByteArray = NodeId.bytesOf(publicEncoded)
 
-    private val sharedKeys = HashMap<String, ByteArray>()
+    // Bounded: strangers can send us messages from endless throwaway keys.
+    private val sharedKeys = object : LinkedHashMap<String, ByteArray>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>) = size > 256
+    }
 
     fun sign(data: ByteArray) = Crypto.sign(keyPair.private, data)
 

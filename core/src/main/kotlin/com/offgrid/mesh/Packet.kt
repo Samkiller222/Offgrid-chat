@@ -40,7 +40,13 @@ class Packet(
         }
     }
 
-    val idHex: String get() = id.toHex()
+    /**
+     * The packet's identity everywhere (dedup, storage, receipts): its random [id] bound to the
+     * author's key. Anyone can copy someone else's [id], but not with their key, so a forged
+     * packet can't shadow a real one.
+     */
+    val uid: ByteArray by lazy { Crypto.sha256(originKey, id).copyOf(ID_SIZE) }
+    val idHex: String get() = uid.toHex()
     val originId: String by lazy { NodeId.of(originKey) }
     val destinationId: String? get() = if (isBroadcast) null else destination.toHex()
     val isBroadcast: Boolean get() = destination.contentEquals(BROADCAST)

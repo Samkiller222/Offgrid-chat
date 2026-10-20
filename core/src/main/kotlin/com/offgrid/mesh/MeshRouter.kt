@@ -73,6 +73,11 @@ class MeshRouter(
         private const val MAX_HANDLED = 2000
         const val PACKETS_PER_HOUR = 120
         const val ANNOUNCES_PER_HOUR = 6
+        const val ACKS_PER_HOUR = 600
+        private const val RATE_WINDOW = 6 * HOUR
+        /** Most packets from any one other person we'll hold, so nobody can monopolise storage. */
+        const val MAX_STORED_PER_ORIGIN = 200
+        private const val MAX_CONTACTS = 2000
         private val PRIORITY = listOf(Packet.Type.ACK, Packet.Type.MESSAGE, Packet.Type.ANNOUNCE)
     }
 
@@ -87,6 +92,8 @@ class MeshRouter(
     private val contacts = HashMap<String, Contact>()
     private val handled = ArrayDeque<ByteArray>()
     private val rateCounts = LinkedHashMap<String, Int>()
+    /** Who each of our private messages went to, so only they can confirm delivery. */
+    private val sentTo = LinkedHashMap<String, String>()
 
     val myId: String get() = identity.id
     val myPublicKey: ByteArray get() = identity.publicEncoded
@@ -147,7 +154,7 @@ class MeshRouter(
         pruneExpired()
         val out = ByteArrayOutputStream()
         out.write(LINK_INVENTORY.toInt())
-        store.all().forEach { out.write(it.id, 0, SHORT_ID) }
+        store.all().forEach { out.write(it.uid, 0, SHORT_ID) }
         // Also list what we handled but don't carry (delivered to us, or at its hop limit),
         // so neighbours don't resend it every time we meet.
         handled.forEach { out.write(it, 0, SHORT_ID) }
@@ -162,7 +169,7 @@ class MeshRouter(
         }
         val now = clock()
         store.all()
-            .filter { !it.isExpired(now) && it.id.copyOf(SHORT_ID).toHex() !in theirs }
+            .filter { !it.isExpired(now) && it.uid.copyOf(SHORT_ID).toHex() !in theirs }
             // Receipts first (they free up space everywhere), then messages, then announcements.
             .sortedBy { PRIORITY.indexOf(it.type) }
             .forEach { sendPacket(link, it) }
@@ -198,8 +205,12 @@ class MeshRouter(
         } else {
             val contact = contacts[toId] ?: throw IllegalArgumentException("unknown contact $toId")
             val id = Crypto.randomBytes(Packet.ID_SIZE)
-            val sealed = Crypto.encrypt(identity.sharedKeyWith(contact.publicKey), body, id)
-            originate(Packet.Type.MESSAGE, toId.hexToBytes(), sealed, now + MESSAGE_LIFETIME, MESSAGE_MAX_HOPS, id)
+            val dest = toId.hexToBytes()
+            val sealed = Crypto.encrypt(identity.sharedKeyWith(contact.publicKey), body, sealingContext(id, identity.idBytes, dest))
+            originate(Packet.Type.MESSAGE, dest, sealed, now + MESSAGE_LIFETIME, MESSAGE_MAX_HOPS, id).also {
+                sentTo[it.idHex] = toId
+                while (sentTo.size > 5000) sentTo.remove(sentTo.keys.first())
+            }
         }
         return ChatMessage(packet.idHex, myId, myName, toId, text, now, 0, outgoing = true)
     }
@@ -232,12 +243,15 @@ class MeshRouter(
         if (idHex in seen) return
         val now = clock()
         if (packet.isExpired(now)) return
+        // Written to avoid overflow: hostile values near Long.MIN/MAX must not slip through.
         if (packet.createdAt > now + MAX_CLOCK_SKEW) return
-        if (packet.expiresAt - packet.createdAt > MAX_LIFETIME) return
-        if (packet.hops > packet.maxHops) return
+        if (packet.createdAt < now - MAX_LIFETIME - MAX_CLOCK_SKEW) return
+        if (packet.expiresAt < packet.createdAt || packet.expiresAt > now + MAX_LIFETIME) return
+        if (packet.maxHops > MESSAGE_MAX_HOPS || packet.hops > packet.maxHops) return
         if (!packet.verify()) return
+        // Rate check before marking seen, so spam over the limit can't flush the seen set.
+        if (overRateLimit(packet, now)) return
         markSeen(idHex)
-        if (overRateLimit(packet)) return
         if (!process(packet)) {
             noteHandled(packet)
             return
@@ -250,10 +264,18 @@ class MeshRouter(
      * spammer can't fill everyone's storage, while a burst of honest messages that waited in
      * someone's pocket still gets through. Packets for us are always accepted.
      */
-    private fun overRateLimit(packet: Packet): Boolean {
-        if (packet.destinationId == myId || packet.originId == myId) return false
-        val limit = if (packet.type == Packet.Type.ANNOUNCE) ANNOUNCES_PER_HOUR else PACKETS_PER_HOUR
-        val key = "${packet.originId}:${packet.type.code}:${packet.createdAt / HOUR}"
+    private fun overRateLimit(packet: Packet, now: Long): Boolean {
+        if (packet.originId == myId) return false
+        val limit = when (packet.type) {
+            Packet.Type.ANNOUNCE -> ANNOUNCES_PER_HOUR
+            // Receipts are owed for every message someone receives, including spam sent to them.
+            Packet.Type.ACK -> ACKS_PER_HOUR
+            Packet.Type.MESSAGE -> PACKETS_PER_HOUR
+        }
+        // Bucket by the author's clock, so honest messages carried for hours arrive together
+        // fine, but clamp to our recent past so backdating can't open hundreds of buckets.
+        val bucket = maxOf(packet.createdAt, now - RATE_WINDOW) / HOUR
+        val key = "${packet.originId}:${packet.type.code}:$bucket"
         val count = (rateCounts[key] ?: 0) + 1
         rateCounts[key] = count
         while (rateCounts.size > 20_000) rateCounts.remove(rateCounts.keys.first())
@@ -261,7 +283,7 @@ class MeshRouter(
     }
 
     private fun noteHandled(packet: Packet) {
-        handled.addLast(packet.id.copyOf(SHORT_ID))
+        handled.addLast(packet.uid.copyOf(SHORT_ID))
         while (handled.size > MAX_HANDLED) handled.removeFirst()
     }
 
@@ -294,11 +316,13 @@ class MeshRouter(
                 // Keyed by acknowledger: a stranger's fake receipt can't cancel someone else's message.
                 delivered.add(deliveryKey(messageId, packet.originId))
                 val original = store.get(messageId)
-                if (original != null && original.destinationId == packet.originId) {
-                    store.remove(messageId)
-                    if (original.originId == myId) listener.onDelivered(messageId)
+                if (original != null && original.destinationId == packet.originId) store.remove(messageId)
+                if (packet.destinationId == myId) {
+                    // Only the person we wrote to can confirm delivery.
+                    val recipient = sentTo[messageId] ?: original?.destinationId
+                    if (recipient == packet.originId) listener.onDelivered(messageId)
+                    return false
                 }
-                if (packet.destinationId == myId) return false
             }
         }
         return true
@@ -308,21 +332,24 @@ class MeshRouter(
     private fun relay(packet: Packet, fromLink: String?): Boolean {
         if (packet.hops + 1 > packet.maxHops) return false
         val next = packet.withHops(packet.hops + 1)
-        store.put(next)
+        val theirs = if (packet.originId == myId) 0 else store.all().count { it.originId == packet.originId }
+        if (theirs < MAX_STORED_PER_ORIGIN) store.put(next)
         links.filter { it != fromLink }.forEach { sendPacket(it, next) }
         return true
     }
 
     private fun deliverDirect(packet: Packet) {
         val key = identity.sharedKeyWith(packet.originKey)
-        val body = Crypto.decrypt(key, packet.payload, packet.id) ?: return
+        val aad = sealingContext(packet.id, NodeId.bytesOf(packet.originKey), packet.destination)
+        val body = Crypto.decrypt(key, packet.payload, aad) ?: return
+        delivered.add(deliveryKey(packet.idHex, myId))  // a replay later must not show it twice
         val (name, text) = decodeBody(body) ?: return
         listener.onMessage(
             ChatMessage(packet.idHex, packet.originId, name, myId, text, packet.createdAt, packet.hops, false),
         )
         // Signed receipt back to the sender; it travels the mesh like any other packet.
         originate(
-            Packet.Type.ACK, NodeId.bytesOf(packet.originKey), packet.id,
+            Packet.Type.ACK, NodeId.bytesOf(packet.originKey), packet.uid,
             clock() + MESSAGE_LIFETIME, MESSAGE_MAX_HOPS,
         )
     }
@@ -339,9 +366,15 @@ class MeshRouter(
         val contact = Contact(packet.originId, name, packet.originKey, packet.createdAt)
         val known = contacts[contact.id]
         if (known != null && known.lastSeen > contact.lastSeen) return
+        // Trust on first use: a person's key never changes once we know it.
+        if (known != null && !known.publicKey.contentEquals(contact.publicKey)) return
         contacts[contact.id] = contact
+        if (contacts.size > MAX_CONTACTS) contacts.values.minByOrNull { it.lastSeen }?.let { contacts.remove(it.id) }
         listener.onContact(contact)
     }
+
+    /** Authenticated alongside the ciphertext: which packet, from whom, to whom. */
+    private fun sealingContext(id: ByteArray, from: ByteArray, to: ByteArray) = id + from + to
 
     private fun deliveryKey(messageId: String, recipientId: String) = "$messageId:$recipientId"
 
