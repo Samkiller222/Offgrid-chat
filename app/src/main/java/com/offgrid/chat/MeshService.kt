@@ -23,6 +23,7 @@ import com.offgrid.mesh.Identity
 import com.offgrid.mesh.MeshListener
 import com.offgrid.mesh.MeshRouter
 import java.io.File
+import java.util.concurrent.Executors
 
 /**
  * Keeps the mesh running while the screen is off or the app is in the background.
@@ -39,7 +40,17 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
         private const val ANNOUNCE_EVERY_MS = 30 * 60_000L
         private const val PRUNE_EVERY_MS = 10 * 60_000L
 
+        /** Stop relaying entirely (saves battery; this phone stops carrying messages for others). */
+        fun stop(context: Context) {
+            context.getSharedPreferences("offgrid", MODE_PRIVATE).edit().putBoolean("enabled", false).apply()
+            context.stopService(Intent(context, MeshService::class.java))
+        }
+
+        fun isEnabled(context: Context) =
+            context.getSharedPreferences("offgrid", MODE_PRIVATE).getBoolean("enabled", true)
+
         fun start(context: Context) {
+            context.getSharedPreferences("offgrid", MODE_PRIVATE).edit().putBoolean("enabled", true).apply()
             val intent = Intent(context, MeshService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
             else context.startService(intent)
@@ -47,6 +58,8 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
     }
 
     private val main = Handler(Looper.getMainLooper())
+    /** All disk writes go through one background thread, in order. */
+    private val io = Executors.newSingleThreadExecutor()
     lateinit var router: MeshRouter
         private set
     lateinit var chats: ChatStore
@@ -71,8 +84,8 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
         createChannels()
         goForeground()
 
-        chats = ChatStore(File(filesDir, "chat"))
-        router = MeshRouter(loadIdentity(), FilePacketStore(File(filesDir, "packets")), this)
+        chats = ChatStore(File(filesDir, "chat"), io)
+        router = MeshRouter(loadIdentity(), FilePacketStore(File(filesDir, "packets"), io = io), this)
         chats.contacts().forEach { router.rememberContact(it) }
         transport = BleTransport(this, this)
         router.transport = transport
@@ -93,6 +106,7 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
         main.removeCallbacksAndMessages(null)
         unregisterReceiver(bluetoothState)
         transport.stop()
+        io.shutdown()
         Mesh.service = null
         Mesh.changed()
         super.onDestroy()

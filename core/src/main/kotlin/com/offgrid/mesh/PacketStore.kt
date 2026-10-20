@@ -1,6 +1,7 @@
 package com.offgrid.mesh
 
 import java.io.File
+import java.util.concurrent.Executor
 
 /**
  * Packets this phone is carrying for others (and its own, until delivered).
@@ -24,8 +25,12 @@ open class MemoryPacketStore(private val capacity: Int = 1000) : PacketStore {
 
     override fun put(packet: Packet) {
         packets[packet.idHex] = packet
-        while (packets.size > capacity) remove(packets.keys.first())
+        while (packets.size > capacity) remove(evictionCandidate())
     }
+
+    /** Oldest announcement first (they're re-sent every 30 minutes anyway), else the oldest packet. */
+    private fun evictionCandidate(): String =
+        packets.values.firstOrNull { it.type == Packet.Type.ANNOUNCE }?.idHex ?: packets.keys.first()
 
     override fun remove(idHex: String) {
         packets.remove(idHex)
@@ -33,7 +38,12 @@ open class MemoryPacketStore(private val capacity: Int = 1000) : PacketStore {
 }
 
 /** Keeps one file per packet so carried messages survive the app or phone restarting. */
-class FilePacketStore(private val dir: File, capacity: Int = 1000) : MemoryPacketStore(capacity) {
+class FilePacketStore(
+    private val dir: File,
+    capacity: Int = 1000,
+    /** Where disk writes run. Pass a single-thread executor on Android to keep I/O off the main thread. */
+    private val io: Executor = Executor { it.run() },
+) : MemoryPacketStore(capacity) {
     init {
         dir.mkdirs()
         dir.listFiles()
@@ -45,12 +55,13 @@ class FilePacketStore(private val dir: File, capacity: Int = 1000) : MemoryPacke
     }
 
     override fun put(packet: Packet) {
-        File(dir, packet.idHex).writeBytes(packet.encode())
+        val bytes = packet.encode()
+        io.execute { File(dir, packet.idHex).writeBytes(bytes) }
         super.put(packet)
     }
 
     override fun remove(idHex: String) {
-        File(dir, idHex).delete()
+        io.execute { File(dir, idHex).delete() }
         super.remove(idHex)
     }
 }

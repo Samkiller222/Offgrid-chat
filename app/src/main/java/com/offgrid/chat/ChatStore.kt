@@ -6,6 +6,7 @@ import com.offgrid.mesh.Contact
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.Executor
 
 /** A message as shown in the UI, plus its delivery state. */
 data class StoredMessage(val message: ChatMessage, val delivered: Boolean) {
@@ -19,7 +20,7 @@ data class StoredMessage(val message: ChatMessage, val delivered: Boolean) {
 }
 
 /** Chat history and known people, saved as small JSON files in the app's private storage. */
-class ChatStore(dir: File) {
+class ChatStore(dir: File, private val io: Executor = Executor { it.run() }) {
     companion object {
         const val EVERYONE = "everyone"
         private const val MAX_MESSAGES = 5000
@@ -102,7 +103,7 @@ class ChatStore(dir: File) {
         writeAtomically(contactsFile, arr.toString())
     }
 
-    private fun writeAtomically(file: File, text: String) {
+    private fun writeAtomically(file: File, text: String) = io.execute {
         val tmp = File(file.parentFile, file.name + ".tmp")
         tmp.writeText(text)
         tmp.renameTo(file)

@@ -58,14 +58,18 @@ class MeshRouter(
         const val MESSAGE_LIFETIME = 72 * HOUR
         const val ANNOUNCE_LIFETIME = 24 * HOUR
         const val MAX_LIFETIME = 7 * 24 * HOUR
-        const val MAX_CLOCK_SKEW = 15 * MINUTE
+        const val MAX_CLOCK_SKEW = HOUR
         const val MESSAGE_MAX_HOPS = 64
         const val ANNOUNCE_MAX_HOPS = 16
+        /** Public messages are for the people around you, so they don't flood the whole country. */
+        const val BROADCAST_LIFETIME = 12 * HOUR
+        const val BROADCAST_MAX_HOPS = 10
         const val MAX_TEXT_BYTES = 4000
         private const val LINK_PACKET: Byte = 1
         private const val LINK_INVENTORY: Byte = 2
         private const val SHORT_ID = 8
         private const val MAX_SEEN = 10_000
+        private val PRIORITY = listOf(Packet.Type.ACK, Packet.Type.MESSAGE, Packet.Type.ANNOUNCE)
     }
 
     var transport: Transport? = null
@@ -83,7 +87,7 @@ class MeshRouter(
         for (packet in store.all()) {
             if (packet.isExpired(now)) store.remove(packet.idHex) else markSeen(packet.idHex)
             if (packet.type == Packet.Type.ANNOUNCE) learnContact(packet)
-            if (packet.type == Packet.Type.ACK) delivered.add(packet.payload.toHex())
+            if (packet.type == Packet.Type.ACK) delivered.add(deliveryKey(packet.payload.toHex(), packet.originId))
         }
     }
 
@@ -136,11 +140,11 @@ class MeshRouter(
             theirs.add(body.copyOfRange(i * SHORT_ID, (i + 1) * SHORT_ID).toHex())
         }
         val now = clock()
-        for (packet in store.all()) {
-            if (packet.isExpired(now)) continue
-            if (packet.id.copyOf(SHORT_ID).toHex() in theirs) continue
-            sendPacket(link, packet)
-        }
+        store.all()
+            .filter { !it.isExpired(now) && it.id.copyOf(SHORT_ID).toHex() !in theirs }
+            // Receipts first (they free up space everywhere), then messages, then announcements.
+            .sortedBy { PRIORITY.indexOf(it.type) }
+            .forEach { sendPacket(link, it) }
     }
 
     private fun sendPacket(link: String, packet: Packet) {
@@ -168,7 +172,7 @@ class MeshRouter(
         val body = encodeBody(myName, text)
         val now = clock()
         val packet = if (toId == null) {
-            originate(Packet.Type.MESSAGE, Packet.BROADCAST, body, now + MESSAGE_LIFETIME, MESSAGE_MAX_HOPS)
+            originate(Packet.Type.MESSAGE, Packet.BROADCAST, body, now + BROADCAST_LIFETIME, BROADCAST_MAX_HOPS)
         } else {
             val contact = contacts[toId] ?: throw IllegalArgumentException("unknown contact $toId")
             val id = Crypto.randomBytes(Packet.ID_SIZE)
@@ -223,7 +227,7 @@ class MeshRouter(
             }
 
             Packet.Type.MESSAGE -> {
-                if (idHex in delivered) return
+                if (packet.destinationId != null && deliveryKey(idHex, packet.destinationId!!) in delivered) return
                 if (packet.destinationId == myId) {
                     deliverDirect(packet)
                     return  // Reached its destination: no need to carry it further.
@@ -232,13 +236,17 @@ class MeshRouter(
             }
 
             Packet.Type.ACK -> {
+                if (packet.payload.size != Packet.ID_SIZE) return
                 val messageId = packet.payload.toHex()
-                delivered.add(messageId)
-                store.remove(messageId)
-                if (packet.destinationId == myId) {
-                    listener.onDelivered(messageId)
-                    return
+                // Remember who acknowledged, so the message is dropped if it shows up later.
+                // Keyed by acknowledger: a stranger's fake receipt can't cancel someone else's message.
+                delivered.add(deliveryKey(messageId, packet.originId))
+                val original = store.get(messageId)
+                if (original != null && original.destinationId == packet.originId) {
+                    store.remove(messageId)
+                    if (original.originId == myId) listener.onDelivered(messageId)
                 }
+                if (packet.destinationId == myId) return
             }
         }
         relay(packet, fromLink)
@@ -280,6 +288,8 @@ class MeshRouter(
         contacts[contact.id] = contact
         listener.onContact(contact)
     }
+
+    private fun deliveryKey(messageId: String, recipientId: String) = "$messageId:$recipientId"
 
     private fun markSeen(idHex: String) {
         seen.add(idHex)

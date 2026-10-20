@@ -31,6 +31,7 @@ class MainActivity : Activity() {
     private lateinit var me: TextView
     private lateinit var list: ListView
     private lateinit var adapter: ArrayAdapter<Row>
+    private lateinit var toggle: Button
     private val refresh: () -> Unit = { render() }
 
     private val requiredPermissions: Array<String>
@@ -53,6 +54,16 @@ class MainActivity : Activity() {
         val rename = Button(this).apply {
             text = "Change my name"
             setOnClickListener { askName() }
+        }
+        toggle = Button(this).apply {
+            setOnClickListener {
+                if (MeshService.isEnabled(this@MainActivity)) {
+                    MeshService.stop(this@MainActivity)
+                } else {
+                    MeshService.start(this@MainActivity)
+                }
+                render()
+            }
         }
         adapter = object : ArrayAdapter<Row>(this, android.R.layout.simple_list_item_2, android.R.id.text1) {
             override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
@@ -79,7 +90,13 @@ class MainActivity : Activity() {
                 setPadding(pad, pad, pad, 0)
                 addView(me)
                 addView(status)
-                addView(rename)
+                addView(
+                    LinearLayout(this@MainActivity).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        addView(rename)
+                        addView(toggle)
+                    },
+                )
                 addView(
                     TextView(this@MainActivity).apply {
                         text = "Conversations (people appear here once their phone is reached through the mesh)"
@@ -118,7 +135,7 @@ class MainActivity : Activity() {
             @Suppress("MissingPermission")
             startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
         }
-        if (Mesh.service == null) MeshService.start(this)
+        if (Mesh.service == null && MeshService.isEnabled(this)) MeshService.start(this)
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, results: IntArray) {
@@ -134,9 +151,11 @@ class MainActivity : Activity() {
     }
 
     private fun render() {
+        val enabled = MeshService.isEnabled(this)
+        toggle.text = if (enabled) "Stop relaying" else "Start relaying"
         val s = Mesh.service
         if (s == null) {
-            me.text = "Starting…"
+            me.text = if (enabled) "Starting…" else "Relaying is off. Messages can't reach you or pass through you."
             adapter.clear()
             return
         }

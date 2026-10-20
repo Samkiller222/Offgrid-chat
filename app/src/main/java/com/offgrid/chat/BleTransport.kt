@@ -145,6 +145,7 @@ class BleTransport(
     private val links = HashMap<String, Link>()                // by link name
     private val sightings = HashMap<Int, Sighting>()           // by peer token
     private val connectingTokens = HashMap<Int, Long>()        // token -> started at
+    private val pendingGatts = HashMap<Int, BluetoothGatt>()   // token -> dial in progress
     private val backoff = HashMap<Int, Pair<Long, Long>>()     // token -> (retry after, delay)
 
     val linkCount: Int get() = links.values.count { it.ready }
@@ -182,6 +183,8 @@ class BleTransport(
         server = null
         sightings.clear()
         connectingTokens.clear()
+        pendingGatts.values.forEach { it.disconnect(); it.close() }
+        pendingGatts.clear()
     }
 
     // ------------------------------------------------------------------ Transport
@@ -302,7 +305,7 @@ class BleTransport(
                     HELLO_UUID -> if (value.size == TOKEN_SIZE) {
                         l.peerToken = ByteBuffer.wrap(value).int
                         // If we were also dialing them, our outgoing attempt is redundant.
-                        l.peerToken?.let { connectingTokens.remove(it) }
+                        l.peerToken?.let { cancelDial(it) }
                     }
                     RX_UUID -> receiveFrame(l, value)
                 }
@@ -432,11 +435,17 @@ class BleTransport(
         connectingTokens[peerToken] = now
         Log.i(TAG, "connecting to ${s.device.address}")
         val gatt = s.device.connectGatt(context, false, clientCallback(peerToken), BluetoothDevice.TRANSPORT_LE)
-        if (gatt == null) connectFailed(peerToken)
+        if (gatt == null) connectFailed(peerToken) else pendingGatts[peerToken] = gatt
+    }
+
+    /** Abandon an outgoing dial, e.g. because the peer connected to us first. */
+    private fun cancelDial(peerToken: Int) {
+        connectingTokens.remove(peerToken)
+        pendingGatts.remove(peerToken)?.let { it.disconnect(); it.close() }
     }
 
     private fun connectFailed(peerToken: Int) {
-        connectingTokens.remove(peerToken)
+        cancelDial(peerToken)
         val delay = ((backoff[peerToken]?.second ?: 2_500L) * 2).coerceAtMost(MAX_BACKOFF_MS)
         backoff[peerToken] = SystemClock.elapsedRealtime() + delay to delay
     }
@@ -465,6 +474,7 @@ class BleTransport(
     private fun clientCallback(peerToken: Int) = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             main.post {
+                if (pendingGatts[peerToken] === gatt) pendingGatts.remove(peerToken)
                 val address = gatt.device.address
                 if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
                     if (!running || isLinked(peerToken)) {

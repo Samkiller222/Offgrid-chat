@@ -200,4 +200,84 @@ class MeshRouterTest {
         assertEquals(1, b.inbox.size)
         assertEquals(1, a.deliveredIds.size)
     }
+
+    @Test
+    fun fakeReceiptFromStrangerDoesNotCancelMessage() {
+        val net = SimNetwork()
+        val (a, b, c, m) = listOf("a", "b", "c", "mallory").map { net.node(it) }
+        net.connect(b, c)
+        c.router.announce("Carol")
+        net.run()
+        net.disconnect(b, c)
+        net.connect(a, b)
+        val sent = a.router.sendText("hi carol", "Alice", toId = c.id)
+        net.run()
+
+        // Mallory forges a receipt for Alice's message id and pushes it to B.
+        val forgedAck = forge(m.identity, Packet.Type.ACK, a.identity.idBytes, sent.id.hexToBytes(), net.now)
+        net.connect(m, b)
+        b.router.onLinkData("mallory", byteArrayOf(1) + forgedAck.encode())
+        net.run()
+
+        assertTrue(a.deliveredIds.isEmpty(), "forged receipt must not mark delivered")
+        assertTrue(b.store.get(sent.id) != null, "relay must keep carrying the message")
+        net.connect(b, c)
+        assertEquals("hi carol", c.inbox.single().text)
+    }
+
+    @Test
+    fun tamperedRelayCopyIsRejected() {
+        val net = SimNetwork()
+        val (a, b) = listOf("a", "b").map { net.node(it) }
+        a.router.sendText("original", "Alice")
+        val p = a.store.all().single()
+        val evil = Packet(p.type, p.id, p.originKey, p.destination, p.createdAt, p.expiresAt, p.hops, p.maxHops,
+            byteArrayOf(5) + "Alice".toByteArray() + "changed".toByteArray(), p.signature)
+        b.router.linkUp("a")
+        b.router.onLinkData("a", byteArrayOf(1) + evil.encode())
+        assertTrue(b.inbox.isEmpty())
+    }
+
+    @Test
+    fun storeEvictsAnnouncementsBeforeMessages() {
+        val net = SimNetwork()
+        val a = net.node("a")
+        val store = MemoryPacketStore(capacity = 3)
+        val id = a.identity
+        val msg = forge(id, Packet.Type.MESSAGE, Packet.BROADCAST, byteArrayOf(0), net.now)
+        store.put(msg)
+        repeat(4) { store.put(forge(id, Packet.Type.ANNOUNCE, Packet.BROADCAST, "x".toByteArray(), net.now)) }
+        assertEquals(3, store.all().size)
+        assertTrue(store.get(msg.idHex) != null)
+    }
+
+    @Test
+    fun fileStoreSurvivesRestart() {
+        val dir = kotlin.io.path.createTempDirectory("packets").toFile()
+        val id = Identity.generate()
+        val p = forge(id, Packet.Type.MESSAGE, Packet.BROADCAST, byteArrayOf(0), System.currentTimeMillis())
+        FilePacketStore(dir).put(p)
+        val reloaded = FilePacketStore(dir)
+        assertTrue(reloaded.get(p.idHex)!!.verify())
+        reloaded.remove(p.idHex)
+        assertTrue(FilePacketStore(dir).all().isEmpty())
+        dir.deleteRecursively()
+    }
+
+    @Test
+    fun identityRestoresToSameAddressAndCanDecrypt() {
+        val net = SimNetwork()
+        val (a, b) = listOf("a", "b").map { net.node(it) }
+        val restored = Identity.restore(b.identity.privateEncoded, b.identity.publicEncoded)
+        assertEquals(b.id, restored.id)
+        assertTrue(a.identity.sharedKeyWith(b.identity.publicEncoded)
+            .contentEquals(restored.sharedKeyWith(a.identity.publicEncoded)))
+    }
+
+    private fun forge(who: Identity, type: Packet.Type, dest: ByteArray, payload: ByteArray, now: Long): Packet {
+        val id = Crypto.randomBytes(Packet.ID_SIZE)
+        val unsigned = Packet(type, id, who.publicEncoded, dest, now, now + MeshRouter.HOUR, 0, 10, payload, ByteArray(0))
+        return Packet(type, id, who.publicEncoded, dest, now, now + MeshRouter.HOUR, 0, 10, payload,
+            who.sign(unsigned.signedBytes()))
+    }
 }
