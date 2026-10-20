@@ -70,6 +70,8 @@ class MeshRouter(
         private const val SHORT_ID = 8
         private const val MAX_SEEN = 10_000
         private const val MAX_HANDLED = 2000
+        const val PACKETS_PER_HOUR = 120
+        const val ANNOUNCES_PER_HOUR = 6
         private val PRIORITY = listOf(Packet.Type.ACK, Packet.Type.MESSAGE, Packet.Type.ANNOUNCE)
     }
 
@@ -83,6 +85,7 @@ class MeshRouter(
     private val delivered = LinkedHashSet<String>()     // message ids we've seen an ACK for
     private val contacts = HashMap<String, Contact>()
     private val handled = ArrayDeque<ByteArray>()
+    private val rateCounts = LinkedHashMap<String, Int>()
 
     val myId: String get() = identity.id
     val myPublicKey: ByteArray get() = identity.publicEncoded
@@ -233,11 +236,27 @@ class MeshRouter(
         if (packet.hops > packet.maxHops) return
         if (!packet.verify()) return
         markSeen(idHex)
+        if (overRateLimit(packet)) return
         if (!process(packet)) {
             noteHandled(packet)
             return
         }
         if (!relay(packet, fromLink)) noteHandled(packet)
+    }
+
+    /**
+     * Flood protection: each sender gets a budget per hour of *their* clock (createdAt), so a
+     * spammer can't fill everyone's storage, while a burst of honest messages that waited in
+     * someone's pocket still gets through. Packets for us are always accepted.
+     */
+    private fun overRateLimit(packet: Packet): Boolean {
+        if (packet.destinationId == myId || packet.originId == myId) return false
+        val limit = if (packet.type == Packet.Type.ANNOUNCE) ANNOUNCES_PER_HOUR else PACKETS_PER_HOUR
+        val key = "${packet.originId}:${packet.type.code}:${packet.createdAt / HOUR}"
+        val count = (rateCounts[key] ?: 0) + 1
+        rateCounts[key] = count
+        while (rateCounts.size > 20_000) rateCounts.remove(rateCounts.keys.first())
+        return count > limit
     }
 
     private fun noteHandled(packet: Packet) {

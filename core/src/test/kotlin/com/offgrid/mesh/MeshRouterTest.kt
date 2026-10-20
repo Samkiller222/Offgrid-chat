@@ -350,6 +350,26 @@ class MeshRouterTest {
         assertTrue(a.store.all().any { it.type == Packet.Type.ANNOUNCE })
     }
 
+    @Test
+    fun spammerIsRateLimitedButQueuedHonestMessagesPass() {
+        val net = SimNetwork()
+        val (spammer, relay, victim) = listOf("s", "r", "v").map { net.node(it) }
+        net.connect(spammer, relay); net.connect(relay, victim)
+        repeat(MeshRouter.PACKETS_PER_HOUR + 50) { spammer.router.sendText("spam $it", "S") }
+        net.run()
+        assertEquals(MeshRouter.PACKETS_PER_HOUR, victim.inbox.size)
+        assertTrue(relay.router.carriedCount() <= MeshRouter.PACKETS_PER_HOUR + 1)
+
+        // Messages written over several hours and delivered in one burst are fine.
+        val (a, b) = listOf("a", "b").map { net.node(it) }
+        repeat(5) {
+            repeat(100) { a.router.sendText("note $it", "A") }
+            net.now += MeshRouter.HOUR
+        }
+        net.connect(a, b)
+        assertEquals(500, b.inbox.size)
+    }
+
     private fun forge(who: Identity, type: Packet.Type, dest: ByteArray, payload: ByteArray, now: Long): Packet {
         val id = Crypto.randomBytes(Packet.ID_SIZE)
         val unsigned = Packet(type, id, who.publicEncoded, dest, now, now + MeshRouter.HOUR, 0, 10, payload, ByteArray(0))
