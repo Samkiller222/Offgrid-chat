@@ -87,6 +87,10 @@ class MainActivity : Activity() {
                         orientation = LinearLayout.HORIZONTAL
                         addView(rename)
                         addView(toggle)
+                        addView(Button(this@MainActivity).apply {
+                            text = "Debug"
+                            setOnClickListener { startActivity(Intent(this@MainActivity, DebugActivity::class.java)) }
+                        })
                     },
                 )
                 addView(

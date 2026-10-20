@@ -20,7 +20,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
-import android.util.Log
 import com.offgrid.mesh.LoraFragmenter
 import com.offgrid.mesh.Meshtastic
 import java.util.UUID
@@ -107,13 +106,14 @@ class LoraRadio(
         val pieces = try {
             fragmenter.split(bytes)
         } catch (e: IllegalArgumentException) {
-            Log.w(TAG, "packet too big for LoRa, dropped")
+            MeshLog.w(TAG, "packet too big for LoRa, dropped")
             return
         }
         if (queue.size + pieces.size > MAX_QUEUE) {
-            Log.w(TAG, "radio queue full, dropping")
+            MeshLog.w(TAG, "radio queue full, dropping")
             return
         }
+        MeshLog.i(TAG, "sending ${bytes.size} bytes as ${pieces.size} LoRa pieces")
         pieces.forEach { queue.addLast(Op.Write(Meshtastic.broadcast(it, Random.nextInt()), usesTxSlot = true)) }
         pump()
     }
@@ -196,7 +196,7 @@ class LoraRadio(
                 if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
                     if (!g.requestMtu(512)) g.discoverServices()
                 } else {
-                    Log.i(TAG, "radio disconnected ($status)")
+                    MeshLog.i(TAG, "radio disconnected ($status)")
                     scheduleReconnect()
                 }
             }
@@ -214,7 +214,7 @@ class LoraRadio(
                 fromRadio = s?.getCharacteristic(FROMRADIO)
                 fromNum = s?.getCharacteristic(FROMNUM)
                 if (toRadio == null || fromRadio == null || fromNum == null) {
-                    Log.w(TAG, "not a Meshtastic radio")
+                    MeshLog.w(TAG, "not a Meshtastic radio")
                     disconnect()
                     return@post
                 }
@@ -291,9 +291,13 @@ class LoraRadio(
     private fun handle(msg: Meshtastic.FromRadio) {
         msg.queueFree?.let { txFree = it }
         msg.received?.let { got ->
-            fragmenter.accept(got.fromNode, got.payload)?.let { events.onLinkData(LINK, it) }
+            fragmenter.accept(got.fromNode, got.payload)?.let {
+                MeshLog.i(TAG, "received ${it.size} bytes via node ${got.fromNode.toString(16)}")
+                events.onLinkData(LINK, it)
+            }
         }
         if (msg.configCompleteId == configNonce.toLong() && state == State.CONNECTING) {
+            MeshLog.i(TAG, "radio $deviceName ready")
             state = State.CONNECTED
             events.onLinkUp(LINK)
             Mesh.changed()
@@ -303,14 +307,14 @@ class LoraRadio(
     private fun opDone(status: Int) {
         busy = false
         if (failed(status)) return
-        if (status != BluetoothGatt.GATT_SUCCESS) Log.w(TAG, "radio op failed: $status")
+        if (status != BluetoothGatt.GATT_SUCCESS) MeshLog.w(TAG, "radio op failed: $status")
         pump()
     }
 
     /** Auth/encryption errors mean the bond is gone or refused: start over (which re-pairs). */
     private fun failed(status: Int): Boolean {
         if (status != 5 && status != 15 && status != 137) return false
-        Log.w(TAG, "radio refused us ($status), re-pairing")
+        MeshLog.w(TAG, "radio refused us ($status), re-pairing")
         scheduleReconnect()
         return true
     }
@@ -398,7 +402,7 @@ class LoraRadio(
         try {
             scanner.startScan(listOf(filter), settings, cb)
         } catch (e: Exception) {
-            Log.w(TAG, "scan", e)
+            MeshLog.w(TAG, "scan", e)
             return onDone()
         }
         main.postDelayed({

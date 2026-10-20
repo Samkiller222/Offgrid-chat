@@ -199,12 +199,14 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
     // ------------------------------------------------------------------ transport -> router
 
     override fun onLinkUp(link: String) {
+        MeshLog.i("Mesh", "link up $link")
         router.linkUp(link, sync = link != LoraRadio.LINK)
         if (link == LoraRadio.LINK) router.announce(myName)  // let LoRa-side people find us
         Mesh.changed()
     }
 
     override fun onLinkDown(link: String) {
+        MeshLog.i("Mesh", "link down $link")
         router.linkDown(link)
         Mesh.changed()
     }
@@ -217,6 +219,7 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
     // ------------------------------------------------------------------ router -> app
 
     override fun onMessage(message: ChatMessage) {
+        MeshLog.i("Mesh", "message ${message.id.take(8)} from ${message.fromName} after ${message.hops} hops")
         if (chats.add(message)) {
             notifyMessage(message)
             Mesh.changed()
@@ -224,11 +227,13 @@ class MeshService : Service(), BleTransport.Events, MeshListener {
     }
 
     override fun onDelivered(messageId: String) {
+        MeshLog.i("Mesh", "delivered ${messageId.take(8)}")
         chats.markDelivered(messageId)
         Mesh.changed()
     }
 
     override fun onContact(contact: Contact) {
+        MeshLog.i("Mesh", "heard from ${contact.name} (${contact.id.take(8)})")
         chats.putContact(contact)
         Mesh.changed()
     }

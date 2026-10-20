@@ -24,7 +24,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
 import android.os.SystemClock
-import android.util.Log
 import com.offgrid.mesh.Crypto
 import com.offgrid.mesh.Framing
 import com.offgrid.mesh.Transport
@@ -158,7 +157,7 @@ class BleTransport(
     fun start() {
         if (running) return
         if (adapter?.isEnabled != true) {
-            Log.w(TAG, "Bluetooth is off")
+            MeshLog.w(TAG, "Bluetooth is off")
             return
         }
         running = true
@@ -177,7 +176,7 @@ class BleTransport(
             adapter?.bluetoothLeScanner?.stopScan(scanCallback)
             adapter?.bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
         } catch (e: Exception) {
-            Log.w(TAG, "stop", e)
+            MeshLog.w(TAG, "stop", e)
         }
         links.values.toList().forEach { dropLink(it) }
         clientLinks.values.forEach { it.close() }
@@ -225,7 +224,7 @@ class BleTransport(
         if (l.ready) return
         l.ready = true
         links[l.name] = l
-        Log.i(TAG, "link up ${l.name} mtu=${l.mtu}")
+        MeshLog.i(TAG, "link up ${l.name} mtu=${l.mtu}")
         events.onLinkUp(l.name)
         pump(l)
     }
@@ -238,7 +237,7 @@ class BleTransport(
         // Give the designated (lower-token) side the first chance to reconnect.
         peer?.let { sightings[it]?.firstSeen = SystemClock.elapsedRealtime() }
         if (links.remove(l.name) != null && l.ready) {
-            Log.i(TAG, "link down ${l.name}")
+            MeshLog.i(TAG, "link down ${l.name}")
             events.onLinkDown(l.name)
         }
         l.ready = false
@@ -283,17 +282,17 @@ class BleTransport(
         server = try {
             btManager?.openGattServer(context, serverCallback)?.also { it.addService(service) }
         } catch (e: Exception) {
-            Log.e(TAG, "openGattServer", e)
+            MeshLog.e(TAG, "openGattServer", e)
             null
         }
-        if (server == null) Log.e(TAG, "Could not open GATT server")
+        if (server == null) MeshLog.e(TAG, "Could not open GATT server")
     }
 
     private val serverCallback = object : BluetoothGattServerCallback() {
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
             post {
                 if (status == BluetoothGatt.GATT_SUCCESS) startAdvertising()
-                else Log.e(TAG, "addService failed: $status")
+                else MeshLog.e(TAG, "addService failed: $status")
             }
         }
 
@@ -404,13 +403,13 @@ class BleTransport(
         try {
             adapter?.bluetoothLeAdvertiser?.startAdvertising(settings, data, scanResponse, advertiseCallback)
         } catch (e: Exception) {
-            Log.e(TAG, "startAdvertising", e)
+            MeshLog.e(TAG, "startAdvertising", e)
         }
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartFailure(errorCode: Int) {
-            Log.e(TAG, "Advertising failed: $errorCode")
+            MeshLog.e(TAG, "Advertising failed: $errorCode")
         }
     }
 
@@ -422,7 +421,7 @@ class BleTransport(
         try {
             adapter?.bluetoothLeScanner?.startScan(listOf(filter), settings, scanCallback)
         } catch (e: Exception) {
-            Log.e(TAG, "startScan", e)
+            MeshLog.e(TAG, "startScan", e)
         }
     }
 
@@ -433,7 +432,7 @@ class BleTransport(
             try {
                 adapter?.bluetoothLeScanner?.stopScan(scanCallback)
             } catch (e: Exception) {
-                Log.w(TAG, "stopScan", e)
+                MeshLog.w(TAG, "stopScan", e)
             }
             startScanning()
             main.postDelayed(this, SCAN_RESTART_MS)
@@ -454,7 +453,7 @@ class BleTransport(
         }
 
         override fun onScanFailed(errorCode: Int) {
-            Log.e(TAG, "Scan failed: $errorCode")
+            MeshLog.e(TAG, "Scan failed: $errorCode")
         }
     }
 
@@ -480,7 +479,7 @@ class BleTransport(
         val myTurn = tokenInt < peerToken || now - s.firstSeen > FALLBACK_CONNECT_MS
         if (!myTurn) return
         connectingTokens[peerToken] = now
-        Log.i(TAG, "connecting to ${s.device.address}")
+        MeshLog.i(TAG, "connecting to ${s.device.address}")
         val gatt = s.device.connectGatt(context, false, clientCallback(peerToken), BluetoothDevice.TRANSPORT_LE)
         if (gatt == null) connectFailed(peerToken) else pendingGatts[peerToken] = gatt
     }
@@ -503,7 +502,7 @@ class BleTransport(
             if (!running) return
             val now = SystemClock.elapsedRealtime()
             connectingTokens.filterValues { now - it > CONNECT_TIMEOUT_MS }.keys.forEach { t ->
-                Log.w(TAG, "connect timeout")
+                MeshLog.w(TAG, "connect timeout")
                 clientLinks.values.filter { it.token == t && !it.ready }.forEach { l ->
                     clientLinks.remove(l.gatt.device.address)
                     l.close()

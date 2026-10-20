@@ -378,6 +378,43 @@ class MeshRouterTest {
         assertEquals(500, b.inbox.size)
     }
 
+    @Test
+    fun walkersCarryMessagesAcrossATown() {
+        // 40 phones wander a 2 km x 2 km town; Bluetooth reaches 50 m. No path exists at any
+        // one moment, yet messages should get through by being carried around.
+        val rnd = kotlin.random.Random(42)
+        val net = SimNetwork()
+        val phones = (0 until 40).map { net.node("p$it") }
+        val pos = phones.associateWith { doubleArrayOf(rnd.nextDouble() * 2000, rnd.nextDouble() * 2000) }
+        val linked = HashSet<Pair<Int, Int>>()
+        fun step() {
+            net.now += MeshRouter.MINUTE
+            for (p in phones) {
+                val xy = pos.getValue(p)
+                xy[0] = (xy[0] + rnd.nextDouble(-80.0, 80.0)).coerceIn(0.0, 2000.0)
+                xy[1] = (xy[1] + rnd.nextDouble(-80.0, 80.0)).coerceIn(0.0, 2000.0)
+            }
+            for (i in phones.indices) for (j in i + 1 until phones.size) {
+                val a = pos.getValue(phones[i]); val b = pos.getValue(phones[j])
+                val near = Math.hypot(a[0] - b[0], a[1] - b[1]) < 50
+                val key = i to j
+                if (near && linked.add(key)) net.connect(phones[i], phones[j])
+                if (!near && linked.remove(key)) net.disconnect(phones[i], phones[j])
+            }
+        }
+        phones.forEach { it.router.announce(it.name) }
+        repeat(6 * 60) { step() }   // 6 hours for announcements to spread
+        val pairs = (0 until 10).map { phones[2 * it] to phones[2 * it + 1] }
+        val sent = pairs.mapNotNull { (from, to) ->
+            if (from.router.contact(to.id) == null) null else from.router.sendText("hi ${to.name}", from.name, to.id)
+        }
+        repeat(12 * 60) { step() }  // 12 more hours of walking
+        val delivered = pairs.count { (_, to) -> to.inbox.any { it.text == "hi ${to.name}" } }
+        println("walkers: ${sent.size} sent after discovery, $delivered delivered")
+        assertTrue(sent.size >= 8, "most people should have discovered each other, got ${sent.size}")
+        assertTrue(delivered >= sent.size - 1, "delivered $delivered of ${sent.size}")
+    }
+
     private fun forge(who: Identity, type: Packet.Type, dest: ByteArray, payload: ByteArray, now: Long): Packet {
         val id = Crypto.randomBytes(Packet.ID_SIZE)
         val unsigned = Packet(type, id, who.publicEncoded, dest, now, now + MeshRouter.HOUR, 0, 10, payload, ByteArray(0))
